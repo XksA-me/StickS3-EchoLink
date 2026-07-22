@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1175" height="500" viewBox="0 0 1175 500">
+  <rect width="1175" height="500" fill="#111923"/>
+  <rect x="44" y="44" width="12" height="412" rx="6" fill="#2dd4bf"/>
+  <rect x="1119" y="44" width="12" height="412" rx="6" fill="#fb7185"/>
+  <circle cx="154" cy="250" r="62" fill="#233746" stroke="#2dd4bf" stroke-width="8"/>
+  <circle cx="1021" cy="250" r="62" fill="#233746" stroke="#fb7185" stroke-width="8"/>
+  <path d="M230 250 H945" stroke="#f8fafc" stroke-width="7" stroke-linecap="round" stroke-dasharray="18 18"/>
+  <text x="587.5" y="215" fill="#f8fafc" font-family="Arial, sans-serif" font-size="72" font-weight="700" text-anchor="middle">StickS3 EchoLink</text>
+  <text x="587.5" y="286" fill="#aab8c5" font-family="Arial, sans-serif" font-size="28" text-anchor="middle">LOCAL ESP-NOW  /  Wi-Fi MQTT  /  LifeTime</text>
+  <text x="587.5" y="390" fill="#647786" font-family="Arial, sans-serif" font-size="20" text-anchor="middle">BANNER PLACEHOLDER - 2.35:1</text>
+</svg>

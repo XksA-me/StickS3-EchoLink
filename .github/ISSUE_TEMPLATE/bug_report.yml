@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible firmware, hardware, transport, or server issue.
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - EchoLink Local / ESP-NOW
+        - EchoLink Wi-Fi / MQTT
+        - Audio recording or playback
+        - LifeTime UI or IMU
+        - Firmware build or upload
+        - MQTT server or Recorder
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Include the expected behavior and exact reproduction steps.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Remove Wi-Fi, MQTT, SSH credentials, private server addresses, and personal recordings.
+      render: shell
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware and firmware revision
+      placeholder: M5StickS3 N8R8, commit SHA
+    validations:
+      required: true

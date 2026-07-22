@@ -1,0 +1,32 @@
+services:
+  mqtt:
+    image: eclipse-mosquitto:2
+    container_name: echolink-mqtt
+    restart: unless-stopped
+    ports:
+      - "1883:1883"
+    volumes:
+      - ./server/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./server/passwords:/mosquitto/config/passwords:ro
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-log:/mosquitto/log
+
+  recorder:
+    build: ./server/recorder
+    container_name: echolink-recorder
+    restart: unless-stopped
+    depends_on:
+      - mqtt
+    environment:
+      MQTT_HOST: mqtt
+      MQTT_PORT: 1883
+      MQTT_USER: ${MQTT_USER}
+      MQTT_PASSWORD: ${MQTT_PASSWORD}
+      MQTT_TOPIC: ${MQTT_TOPIC:-echolink/v1/voice}
+      RECORDINGS_DIR: /recordings
+    volumes:
+      - ./server/recordings:/recordings
+
+volumes:
+  mosquitto-data:
+  mosquitto-log:

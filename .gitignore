@@ -1,0 +1,10 @@
+.env
+.host-build/
+.pio/
+lib/
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+server/passwords
+server/recordings/

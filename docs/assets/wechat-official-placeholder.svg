@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="500" height="500" viewBox="0 0 500 500">
+  <rect width="500" height="500" fill="#ffffff"/>
+  <rect x="18" y="18" width="464" height="464" rx="16" fill="none" stroke="#2dd4bf" stroke-width="10"/>
+  <text x="250" y="220" fill="#111923" font-family="Arial, sans-serif" font-size="32" font-weight="700" text-anchor="middle">OFFICIAL ACCOUNT</text>
+  <text x="250" y="270" fill="#516575" font-family="Arial, sans-serif" font-size="24" text-anchor="middle">QR PLACEHOLDER</text>
+  <text x="250" y="330" fill="#2a9d8f" font-family="Arial, sans-serif" font-size="20" text-anchor="middle">Jian Shuo Python</text>
+</svg>

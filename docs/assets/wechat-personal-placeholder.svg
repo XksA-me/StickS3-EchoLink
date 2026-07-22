@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="500" height="500" viewBox="0 0 500 500">
+  <rect width="500" height="500" fill="#ffffff"/>
+  <rect x="18" y="18" width="464" height="464" rx="16" fill="none" stroke="#fb7185" stroke-width="10"/>
+  <text x="250" y="220" fill="#111923" font-family="Arial, sans-serif" font-size="32" font-weight="700" text-anchor="middle">PERSONAL WECHAT</text>
+  <text x="250" y="270" fill="#516575" font-family="Arial, sans-serif" font-size="24" text-anchor="middle">QR PLACEHOLDER</text>
+  <text x="250" y="330" fill="#d85670" font-family="Arial, sans-serif" font-size="20" text-anchor="middle">QUICK FEEDBACK</text>
+</svg>
