@@ -104,6 +104,9 @@ float swayKickPx = 0.0f;
 float swayEnergy = 0.0f;
 float lastAccelX = 0.0f;
 bool haveAccelSample = false;
+float turnAngleDeg = 0.0f;
+uint32_t lastGyroMs = 0;
+bool turnFlipLatched = false;
 uint32_t meritUntil = 0;
 
 bool outgoingNudgePending = false;
@@ -361,17 +364,41 @@ void drawSandChamber(bool topChamber, float fill, float sway, uint32_t seed) {
                                       : static_cast<float>(y - neck) / chamberHeight;
     const int16_t half = chamberHalf(y, topChamber);
     const float wave = sinf(static_cast<float>(y) * 0.19f + animationFrame * 0.24f + seed) *
-                       (1.0f + sway * 3.0f);
-    const int16_t offset = static_cast<int16_t>(sway * 8.0f + wave);
-    const int16_t left = cx - half + offset;
-    const int16_t width = max<int16_t>(2, half * 2 - 2);
-    const float gradient = topChamber ? chamberProgress : 1.0f - chamberProgress;
+                       (1.0f + sway * 3.5f);
+    const float counterWave = sinf(static_cast<float>(y) * 0.07f - animationFrame * 0.16f +
+                                   seed * 0.37f) * (0.7f + sway * 2.0f);
+    const int16_t requestedOffset = static_cast<int16_t>(sway * 8.0f + wave + counterWave);
+    const int16_t offset = constrain(requestedOffset, -max<int16_t>(0, half - 4),
+                                     max<int16_t>(0, half - 4));
+    const int16_t safeHalf = max<int16_t>(3, half - abs(offset));
+    const int16_t left = cx - safeHalf + offset;
+    const int16_t width = max<int16_t>(2, safeHalf * 2 - 2);
+    const float gradient = topChamber ? 1.0f - chamberProgress : chamberProgress;
     const uint16_t color = gradient < 0.5f
                                ? blend565(kOceanDeep, kOceanMid, gradient * 2.0f)
                                : blend565(kOceanMid, kOceanLight, (gradient - 0.5f) * 2.0f);
     canvas.fillRect(left, y, width, 3, color);
     if ((y + seed) % 9 == 0) {
       canvas.drawFastHLine(left + 3, y, max<int16_t>(2, width - 8), kOceanLight);
+    }
+  }
+
+  // A separate bright crest makes the fill read as moving water instead of
+  // a stack of flat rectangles.
+  const int16_t surfaceY = topChamber ? firstY : lastY;
+  const int16_t surfaceHalf = chamberHalf(surfaceY, topChamber);
+  const int16_t amplitude = 1 + static_cast<int16_t>(sway * 3.0f);
+  const int16_t surfaceOffset = static_cast<int16_t>(sway * 5.0f);
+  const int16_t safeSurfaceHalf = max<int16_t>(3, surfaceHalf - abs(surfaceOffset));
+  for (int16_t x = -safeSurfaceHalf + 2; x <= safeSurfaceHalf - 2; x += 2) {
+    const float phase = static_cast<float>(x) * 0.22f + animationFrame * 0.55f + seed;
+    const int16_t crest = constrain(
+        surfaceY + static_cast<int16_t>(sinf(phase) * amplitude),
+        topChamber ? top : neck + 1, topChamber ? neck - 1 : bottom);
+    const int16_t crestX = 67 + x + surfaceOffset;
+    canvas.drawPixel(crestX, crest, kOceanLight);
+    if ((x + seed) % 6 == 0) {
+      canvas.drawPixel(crestX + 1, crest + (topChamber ? 1 : -1), kOceanMid);
     }
   }
 }
@@ -404,7 +431,7 @@ void drawHourglass() {
   canvas.drawLine(cx + 5, neck + 4, cx + half - 2, bottom - 4, kGlass);
 
   const float progress = hourglassProgress();
-  const float topFill = hourglassMode == HourglassMode::Countdown ? progress : progress;
+  const float topFill = progress;
   const float bottomFill = 1.0f - progress;
   drawSandChamber(true, topFill, swayEnergy, 3);
   drawSandChamber(false, bottomFill, swayEnergy, 17);
@@ -601,6 +628,64 @@ void updateTimer() {
   }
 }
 
+void toggleHourglassDirection(uint32_t now) {
+  if (hourglassTimer.totalMs == 0) {
+    return;
+  }
+  const uint32_t currentProgress = hourglassMode == HourglassMode::Countdown
+                                       ? hourglassTimer.totalMs - hourglassTimer.remainingMs
+                                       : hourglassTimer.reverseMs;
+  const bool rewind = hourglassMode == HourglassMode::Countdown;
+  hourglassMode = rewind ? HourglassMode::Rewind : HourglassMode::Countdown;
+  if (rewind) {
+    hourglassTimer.reverseMs = currentProgress >= hourglassTimer.totalMs ? 0 : currentProgress;
+  } else {
+    hourglassTimer.remainingMs = hourglassTimer.totalMs > currentProgress
+                                     ? hourglassTimer.totalMs - currentProgress : 0;
+  }
+  hourglassTimer.completed = false;
+  hourglassTimer.lastTickMs = now;
+  turnAngleDeg = 0.0f;
+  Serial.printf("Hourglass mode=%s progress=%lu ms\n",
+                rewind ? "TIME REWIND" : "TIME FLOW",
+                static_cast<unsigned long>(currentProgress));
+  markUiDirty();
+}
+
+void detectInPlaneFlip(float z, uint32_t now) {
+  float gx = 0.0f;
+  float gy = 0.0f;
+  float gz = 0.0f;
+  if (!M5.Imu.getGyro(&gx, &gy, &gz)) {
+    return;
+  }
+  if (lastGyroMs == 0) {
+    lastGyroMs = now;
+    return;
+  }
+  const float elapsed = min(0.5f, static_cast<float>(now - lastGyroMs) / 1000.0f);
+  lastGyroMs = now;
+  // When the screen remains face-up/down, Z gyro measures a 180-degree
+  // in-plane turn. This supports turning the visible UI upside down without
+  // relying on an accelerometer face change.
+  if (fabsf(z) < 0.72f) {
+    turnAngleDeg = 0.0f;
+    turnFlipLatched = false;
+    return;
+  }
+  const float turnRate = fabsf(gz);
+  if (turnRate > 45.0f) {
+    turnAngleDeg += turnRate * elapsed;
+    if (!turnFlipLatched && turnAngleDeg >= 135.0f && hourglassTimer.totalMs > 0) {
+      turnFlipLatched = true;
+      toggleHourglassDirection(now);
+    }
+  } else if (turnRate < 15.0f) {
+    turnAngleDeg = 0.0f;
+    turnFlipLatched = false;
+  }
+}
+
 Face classifyFace(float x, float y, float z) {
   const float ax = fabsf(x);
   const float ay = fabsf(y);
@@ -667,8 +752,13 @@ void detectNudgeGesture(float x, float y, float z) {
 
 void updateOrientation(bool foreground) {
   const uint32_t now = millis();
+  const uint32_t sampleInterval = page == Page::Hourglass
+                                      ? (hourglassTimer.running
+                                             ? LIFETIME_HOURGLASS_ACTIVE_IMU_SAMPLE_MS
+                                             : LIFETIME_HOURGLASS_IDLE_IMU_SAMPLE_MS)
+                                      : LIFETIME_IMU_SAMPLE_MS;
   if (!foreground || page == Page::Battery || !imuAvailable ||
-      now - lastImuReadMs < LIFETIME_IMU_SAMPLE_MS) {
+      now - lastImuReadMs < sampleInterval) {
     return;
   }
   lastImuReadMs = now;
@@ -692,6 +782,9 @@ void updateOrientation(bool foreground) {
   }
   lastAccelX = x;
   haveAccelSample = true;
+  if (page == Page::Hourglass) {
+    detectInPlaneFlip(z, now);
+  }
   detectNudgeGesture(x, y, z);
   if (page != Page::Hourglass) {
     return;
@@ -732,6 +825,8 @@ void updateOrientation(bool foreground) {
     }
     hourglassTimer.running = wasRunning && !hourglassTimer.completed;
     hourglassTimer.lastTickMs = now;
+    Serial.printf("Hourglass face=%s mode=%s\n", faceTitle(detected),
+                  hourglassMode == HourglassMode::Rewind ? "TIME REWIND" : "TIME FLOW");
     dropCounter = 0;
     fireworkUntil = 0;
     markUiDirty();
@@ -826,6 +921,9 @@ void resetRuntime() {
   swayKickPx = 0.0f;
   swayEnergy = 0.0f;
   haveAccelSample = false;
+  turnAngleDeg = 0.0f;
+  lastGyroMs = 0;
+  turnFlipLatched = false;
   meritUntil = 0;
 }
 
@@ -906,6 +1004,9 @@ void handleBShortPress() {
     swayKickPx = 0.0f;
     swayEnergy = 0.0f;
     haveAccelSample = false;
+    turnAngleDeg = 0.0f;
+    lastGyroMs = 0;
+    turnFlipLatched = false;
   }
   markUiDirty();
   draw(true);

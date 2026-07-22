@@ -1,30 +1,28 @@
-# LifeTime
+# LifeTime 功能说明
 
-LifeTime is the local utility app inside the single EchoLink firmware. Press `B` to move between `BATTERY`, `HOURGLASS`, and `TOGETHER`; press `A` to perform the current page action.
+LifeTime 是 EchoLink 固件中的本地功能应用。按 `B` 在 `BATTERY`、`HOURGLASS`、`TOGETHER` 三个页面之间切换，按 `A` 执行当前页面的操作。
 
-## Wooden fish
+## 木鱼
 
-On `BATTERY`, each short `A` press increments the persistent merit counter, plays a short woodblock recording, and shows a floating `功德 +1` effect. The effect is intentionally temporary, so the battery page remains quiet while idle.
+在 `BATTERY` 页面短按 `A`，会增加持久化功德计数，播放一段木块敲击声，并显示短暂上浮的 `功德 +1` 字效。动画结束后页面恢复安静状态，不会持续刷新屏幕。
 
-The embedded sample is a mono 16 kHz signed 8-bit conversion of [Woodblock-soft.wav by hollandm](https://freesound.org/people/hollandm/sounds/692828/). The source page describes one soft wooden-stick hit and marks it **Creative Commons 0 (CC0 1.0)**. The converted raw sample is stored at `assets/audio/woodblock-soft-cc0.raw`; the generated C header is `include/generated/woodblock_soft_cc0.h`.
+当前内置音频是 [hollandm 制作的 Woodblock-soft.wav](https://freesound.org/people/hollandm/sounds/692828/)。原页面说明这是木棒敲击木块的一声短音，并标记为 **Creative Commons 0（CC0 1.0）**。转换后的原始采样位于 `assets/audio/woodblock-soft-cc0.raw`，生成的 C 头文件位于 `include/generated/woodblock_soft_cc0.h`。
 
-## Hourglass
+## 沙漏
 
-The on-screen hourglass has one fixed upright direction. The IMU uses the first stable physical side as the starting side, then treats its opposite side as the inverted position:
+屏幕中的沙漏固定为一个竖直方向，不会随着设备旋转而改变 UI 方向。设备首次在某个面稳定放置 1 秒后，该面成为初始面；翻到相对面后进入回流模式：
 
-| Physical position | Mode | Meaning |
+| 设备状态 | 模式 | 含义 |
 | --- | --- | --- |
-| Initial side | `TIME FLOW` | Countdown from the configured duration |
-| Opposite side | `TIME REWIND` | Count up from zero while the sand returns upward |
+| 初始面 | `TIME FLOW` | 从 2 分钟开始倒计时 |
+| 相对面 | `TIME REWIND` | 从 0 开始正计时，沙子向上回流 |
 
-Hold the device on a stable side for one second to select the starting side. Press `A` to start or pause. Turning the device over to the opposite side while running preserves the current fraction and changes the direction of time flow. The display itself stays upright and is never rotated.
+按 `A` 开始或暂停。运行中翻到相对面会保留当前时间比例，并改变时间流动方向。左右晃动时，海洋色沙层会产生横向摆动和波峰高光。
 
-While the timer is running, the screen commits at most one frame every 450 ms. The IMU sample period remains 100 ms so short left/right movement can be smoothed into a low-cost sand sway. When the device is still and the timer is paused, the page does not redraw automatically.
+默认时长由 [LifeTimeConfig.h](../include/LifeTimeConfig.h) 中的 `LIFETIME_FACE_DURATION_SECONDS[0]` 配置，目前为 120 秒。其他五个旧方向配置仍保留，以兼容旧配置，但不再用于旋转 UI 或改变时长。
 
-The sand uses a three-stop ocean palette (`deep`, `mid`, `light`) and small dots, diamonds, stars, and hearts. The heart shape is deliberately smaller than the other particles to keep the sand readable on the 135 x 240 display.
+## 刷新与功耗
 
-The default duration is `LIFETIME_FACE_DURATION_SECONDS[0]` in [LifeTimeConfig.h](../include/LifeTimeConfig.h). The remaining five legacy duration entries are retained for configuration compatibility but are no longer mapped to screen rotation.
+沙漏运行或晃动时最多每 450 ms 提交一帧；暂停且设备静止时不自动刷新。沙漏运行时 IMU 每 100 ms 采样，静止时降为每 320 ms；`TOGETHER` 页面使用 180 ms 采样。电池页每 60 秒读取一次电池数据，木鱼字效只在点击后短时间刷新。
 
-## Power notes
-
-LifeTime only samples the IMU while it is the foreground app. The battery page reads the fuel-gauge values once per minute. The Together animation and the merit effect are event-driven and expire automatically. A single power-key press can still put the whole product into the display-off monitor mode described in [power-management.md](power-management.md).
+更完整的功耗说明见 [功耗设计](power-management.md)。
