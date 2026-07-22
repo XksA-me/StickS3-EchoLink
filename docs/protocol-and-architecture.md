@@ -19,7 +19,7 @@ M5Unified hardware
 ## 并发模型
 
 - Arduino `loop()`：按键、UI、录音状态、播放、ESP-NOW 队列和 LifeTime。
-- MQTT FreeRTOS Task：连接、Keepalive、订阅、接收和发布；空闲检查间隔可配置，发布使用任务通知立即唤醒。
+- MQTT FreeRTOS Task：连接、Keepalive、订阅、接收和发布；空闲检查间隔可配置为 0.1-60 秒，发布使用任务通知立即唤醒。
 - FreeRTOS Queue：在线程之间传递固定大小的网络帧和发布结果。
 - PSRAM：发送语音 5 槽、接收语音 5 槽、录制/重组缓冲和 LifeTime 全屏 Canvas。
 

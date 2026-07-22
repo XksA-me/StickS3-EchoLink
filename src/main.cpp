@@ -36,7 +36,7 @@ constexpr uint32_t kDisplayIdleMs = ECHOLINK_DISPLAY_SLEEP_SECONDS * 1000UL;
 constexpr uint32_t kARecordHoldMs = 1000;
 constexpr uint32_t kADoubleClickWindowMs = 350;
 constexpr uint32_t kDiagnosticIntervalMs = 30000;
-constexpr uint32_t kDefaultMqttPollMs = 250;
+constexpr uint32_t kDefaultMqttPollMs = 1000;
 
 enum class UiState : uint8_t {
   Ready,
@@ -193,6 +193,7 @@ uint32_t lastSetupInfoChange = 0;
 bool displaySleeping = false;
 bool displayDimmed = false;
 bool monitorOnly = false;
+bool powerButtonGesture = false;
 uint32_t lastUserActivity = 0;
 bool aLongHandled = false;
 bool aClickPending = false;
@@ -376,7 +377,7 @@ void drawUi(bool force = false) {
   const bool stateChanged = uiState != lastDrawnState;
   const bool messageChanged = strcmp(message, lastDrawnMessage) != 0;
   const bool volumeChanged = volume != lastDrawnVolume;
-  const bool animate = isAnimatedState(uiState) && millis() - lastUiAnimation >= 200;
+  const bool animate = isAnimatedState(uiState) && millis() - lastUiAnimation >= 500;
   if (!force && !stateChanged && !messageChanged && !volumeChanged && !animate) {
     return;
   }
@@ -884,13 +885,27 @@ void saveWiFiProfiles() {
 }
 
 uint32_t normalizeMqttPollMs(uint32_t value) {
-  static constexpr uint32_t kOptions[] = {20, 250, 1000, 5000};
-  for (const uint32_t option : kOptions) {
-    if (value == option) {
-      return value;
-    }
+  constexpr uint32_t kMinimumMs = 100;
+  constexpr uint32_t kMaximumMs = 60000;
+  return constrain(value, kMinimumMs, kMaximumMs);
+}
+
+uint32_t mqttPollMsFromForm(const String& value, uint32_t fallback) {
+  if (value.length() == 0) {
+    return fallback;
   }
-  return kDefaultMqttPollMs;
+  const float seconds = value.toFloat();
+  if (seconds <= 0.0f) {
+    return fallback;
+  }
+  return normalizeMqttPollMs(static_cast<uint32_t>(seconds * 1000.0f + 0.5f));
+}
+
+String mqttPollSecondsText() {
+  if (networkSettings.mqttPollMs % 1000 == 0) {
+    return String(networkSettings.mqttPollMs / 1000);
+  }
+  return String(static_cast<float>(networkSettings.mqttPollMs) / 1000.0f, 1);
 }
 
 void loadNetworkSettings() {
@@ -1036,7 +1051,7 @@ void maintainWiFiScan() {
 
 void rotateSetupInfo() {
   if (!portalActive || wifiScanInProgress || strcmp(lastResult, "PORTAL READY") != 0 ||
-      millis() - lastSetupInfoChange < 2500) {
+      millis() - lastSetupInfoChange < 8000) {
     return;
   }
   const String suffix = deviceSuffix().substring(4);
@@ -1114,17 +1129,10 @@ String configPage() {
   page += F("'></label><label>MQTT password<input type=password name=mqtt_pass placeholder='unchanged when blank'></label>"
             "<label>Topic<input name=mqtt_topic value='");
   page += htmlEscape(networkSettings.mqttTopic);
-  page += F("'></label><label>消息检查频率 / Message check<select name=mqtt_poll>"
-            "<option value=20");
-  page += networkSettings.mqttPollMs == 20 ? F(" selected>") : F(">");
-  page += F("实时 / Realtime (20 ms)</option><option value=250");
-  page += networkSettings.mqttPollMs == 250 ? F(" selected>") : F(">");
-  page += F("均衡 / Balanced (250 ms)</option><option value=1000");
-  page += networkSettings.mqttPollMs == 1000 ? F(" selected>") : F(">");
-  page += F("省电 / Power save (1 s)</option><option value=5000");
-  page += networkSettings.mqttPollMs == 5000 ? F(" selected>") : F(">");
-  page += F("最长续航 / Maximum saving (5 s)</option></select></label>"
-            "<p class=hint>连接会保持在线；更长间隔会延迟提示，但可减少 CPU 唤醒。</p>"
+  page += F("'></label><label>消息检查间隔 / Message check interval (seconds)"
+            "<input name=mqtt_poll_seconds type=number min=0.1 max=60 step=0.1 value='");
+  page += mqttPollSecondsText();
+  page += F("'></label><p class=hint>范围 0.1-60 秒。连接会保持在线；更长间隔会延迟提示，但可减少 CPU 唤醒。</p>"
             "<button>Save and connect</button></form></main></body></html>");
   return page;
 }
@@ -1200,7 +1208,7 @@ void ensureConfigServer() {
       networkSettings.mqttTopic = "echolink/v1/voice";
     }
     networkSettings.mqttPollMs =
-        normalizeMqttPollMs(static_cast<uint32_t>(configServer.arg("mqtt_poll").toInt()));
+        mqttPollMsFromForm(configServer.arg("mqtt_poll_seconds"), networkSettings.mqttPollMs);
     const String wifiPassword = configServer.arg("wifi_pass");
     const String mqttPassword = configServer.arg("mqtt_pass");
     if (selectedProfile >= 0 && selectedProfile < wifiProfileCount) {
@@ -1842,9 +1850,12 @@ void playNewVoiceAlert() {
     return;
   }
   voiceAlertPending = false;
-  chirp(720);
-  chirp(720);
-  chirp(720);
+  useSpeaker();
+  M5.Speaker.setVolume(255);
+  for (uint8_t i = 0; i < 3; ++i) {
+    M5.Speaker.tone(880, 120, 0, true);
+    delay(600);
+  }
   stopAudio();
   snprintf(lastResult, sizeof(lastResult), "NEW MSG %u", unreadVoiceCount);
   uiState = UiState::Ready;
@@ -2071,6 +2082,16 @@ void loop() {
   M5.update();
   handleSerialCommand();
 
+  if (M5.BtnPWR.wasPressed()) {
+    powerButtonGesture = true;
+    M5.Display.setBrightness(0);
+    M5.Display.sleep();
+    displaySleeping = true;
+    displayDimmed = false;
+  }
+  if (M5.BtnPWR.wasReleased()) {
+    powerButtonGesture = false;
+  }
   if (M5.BtnPWR.wasSingleClicked()) {
     setMonitorOnly(!monitorOnly);
   }
@@ -2091,7 +2112,7 @@ void loop() {
     return;
   }
 
-  if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) {
+  if (!powerButtonGesture && (M5.BtnA.wasPressed() || M5.BtnB.wasPressed())) {
     wakeDisplay();
   }
   handleAButton();
@@ -2148,6 +2169,12 @@ void loop() {
   }
   if (M5.BtnB.wasReleasedAfterHold()) {
     bPortalHoldHandled = false;
+  } else if (portalActive && M5.BtnB.wasSingleClicked()) {
+    stopConfigPortal();
+    restartTransportRequested = true;
+    uiState = UiState::Ready;
+    snprintf(lastResult, sizeof(lastResult), "SETUP EXIT");
+    drawUi(true);
   } else if (!bPortalHoldHandled && M5.BtnB.wasDoubleClicked()) {
     toggleTransport();
   } else if (!bPortalHoldHandled && M5.BtnB.wasSingleClicked()) {

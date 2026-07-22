@@ -11,8 +11,8 @@
 namespace lifetime {
 namespace {
 
-constexpr uint32_t kBatteryRefreshMs = 15000;
-constexpr uint32_t kPulseRefreshMs = 250;
+constexpr uint32_t kBatteryRefreshMs = 60000;
+constexpr uint32_t kPulseRefreshMs = 1000;
 
 constexpr uint16_t kBackground = 0x0862;
 constexpr uint16_t kSurface = 0x18E4;
@@ -23,6 +23,10 @@ constexpr uint16_t kMint = 0x67F3;
 constexpr uint16_t kCyan = 0x4DDF;
 constexpr uint16_t kYellow = 0xFDE6;
 constexpr uint16_t kCoral = 0xFB8F;
+constexpr uint16_t kOrange = 0xFD20;
+constexpr uint16_t kPink = 0xF81F;
+constexpr uint16_t kBlue = 0x4D9F;
+constexpr uint16_t kPurple = 0xA81F;
 constexpr uint16_t kGlass = 0xB67B;
 constexpr uint16_t kFrame = 0xB30D;
 
@@ -77,6 +81,8 @@ uint32_t lastBatteryReadMs = 0;
 uint32_t lastImuReadMs = 0;
 uint32_t lastUiDrawMs = 0;
 uint32_t animationFrame = 0;
+uint32_t dropCounter = 0;
+uint32_t fireworkUntil = 0;
 
 bool outgoingNudgePending = false;
 uint8_t outgoingNudgeType = 1;
@@ -215,7 +221,7 @@ void drawBatteryPage() {
   canvas.setTextColor(kWhite, kBackground);
   canvas.setTextSize(countValue > 999999 ? 2 : 3);
   canvas.drawString(String(countValue), 119, 166);
-  drawFooter("A NEXT", "B +1", kMint);
+  drawFooter("A HIT", "B NEXT", kMint);
 }
 
 float faceAngle(Face face) {
@@ -253,6 +259,59 @@ void fillRotatedTriangle(int16_t x1, int16_t y1, int16_t x2, int16_t y2, int16_t
   canvas.fillTriangle(a.x, a.y, b.x, b.y, c.x, c.y, color);
 }
 
+uint32_t shapeSeed(uint32_t value) {
+  value ^= value >> 16;
+  value *= 0x7feb352dUL;
+  value ^= value >> 15;
+  value *= 0x846ca68bUL;
+  return value ^ (value >> 16);
+}
+
+uint16_t shapeColor(uint32_t seed) {
+  static constexpr uint16_t colors[] = {kYellow, kOrange, kPink, kBlue, kPurple, kMint};
+  return colors[seed % (sizeof(colors) / sizeof(colors[0]))];
+}
+
+void drawRotatedCircle(int16_t x, int16_t y, int16_t radius, float angle, uint16_t color) {
+  const Point point = rotatePoint(x, y, angle);
+  canvas.fillCircle(point.x, point.y, radius, color);
+}
+
+void drawShape(int16_t x, int16_t y, uint8_t shape, float angle, uint16_t color) {
+  switch (shape % 4) {
+    case 0:
+      drawRotatedCircle(x, y, 2, angle, color);
+      break;
+    case 1:
+      fillRotatedTriangle(x, y - 5, x - 5, y + 3, x + 5, y + 3, angle, color);
+      fillRotatedTriangle(x, y + 5, x - 5, y - 3, x + 5, y - 3, angle, color);
+      break;
+    case 2:
+      drawRotatedLine(x, y - 6, x, y + 6, angle, color);
+      drawRotatedLine(x - 6, y, x + 6, y, angle, color);
+      drawRotatedLine(x - 4, y - 4, x + 4, y + 4, angle, color);
+      drawRotatedLine(x - 4, y + 4, x + 4, y - 4, angle, color);
+      break;
+    default:
+      drawRotatedCircle(x - 3, y - 2, 3, angle, color);
+      drawRotatedCircle(x + 3, y - 2, 3, angle, color);
+      fillRotatedTriangle(x - 7, y - 1, x + 7, y - 1, x, y + 8, angle, color);
+      break;
+  }
+}
+
+void drawFireworks() {
+  const int16_t cx = 67;
+  const int16_t cy = 103;
+  for (uint8_t i = 0; i < 8; ++i) {
+    const float angle = static_cast<float>(i) * 45.0f * DEG_TO_RAD;
+    const int16_t x = cx + static_cast<int16_t>(cosf(angle) * 29.0f);
+    const int16_t y = cy + static_cast<int16_t>(sinf(angle) * 29.0f);
+    canvas.drawLine(cx, cy, x, y, shapeColor(shapeSeed(dropCounter + i)));
+    canvas.fillCircle(x, y, 2, shapeColor(shapeSeed(dropCounter + i + 17)));
+  }
+}
+
 void drawHourglass() {
   constexpr int16_t cx = 67;
   constexpr int16_t top = 51;
@@ -283,13 +342,24 @@ void drawHourglass() {
                         kYellow);
   }
   const float fallen = 1.0f - fraction;
-  if (fallen > 0.01f) {
+  if (hourglassTimer.totalMs != 0 && fallen > 0.01f) {
     const int16_t sandY = bottom - 6 - static_cast<int16_t>(40.0f * fallen);
     fillRotatedTriangle(cx, sandY, cx - 27, bottom - 6, cx + 27, bottom - 6, angle, kYellow);
+    const uint8_t shapeCount = min<uint8_t>(10, 1 + static_cast<uint8_t>(fallen * 10.0f));
+    for (uint8_t i = 0; i < shapeCount; ++i) {
+      const uint32_t seed = shapeSeed(dropCounter * 37UL + i * 101UL + 11UL);
+      const int16_t x = cx - 22 + static_cast<int16_t>(seed % 45);
+      const int16_t y = bottom - 9 - static_cast<int16_t>((seed >> 8) % 28);
+      drawShape(x, y, static_cast<uint8_t>(seed >> 16), angle, shapeColor(seed));
+    }
   }
   if (hourglassTimer.running && hourglassTimer.remainingMs > 0) {
-    const Point grain = rotatePoint(cx, neck + 4 + (animationFrame % 23), angle);
-    canvas.fillCircle(grain.x, grain.y, 1, kYellow);
+    const uint32_t seed = shapeSeed(dropCounter * 53UL + animationFrame);
+    const int16_t x = cx - 5 + static_cast<int16_t>(seed % 11);
+    drawShape(x, neck + 7, static_cast<uint8_t>(seed >> 16), angle, shapeColor(seed));
+  }
+  if (fireworkUntil != 0 && static_cast<int32_t>(fireworkUntil - millis()) > 0) {
+    drawFireworks();
   }
 }
 
@@ -306,7 +376,7 @@ void drawHourglassPage() {
                        : hourglassTimer.remainingMs > 0 ? "PAUSED"
                                                        : "TURN AND HOLD";
   drawCentered(status, 198, 1, !imuAvailable ? kCoral : kCyan);
-  drawFooter("A NEXT", hourglassTimer.running ? "A HOLD PAUSE" : "HOLD TO START", kCyan);
+  drawFooter("A START/PAUSE", "B NEXT", kCyan);
 }
 
 void drawDeviceGlyph(int16_t x, int16_t y, uint16_t accent, bool active) {
@@ -348,7 +418,7 @@ void drawTogetherPage() {
            static_cast<unsigned long>(nudgeSentCount),
            static_cast<unsigned long>(nudgeReceivedCount));
   drawCentered(totals, 187, 1, kMuted);
-  drawFooter("A NEXT", "B SEND", kCoral);
+  drawFooter("A PING", "B NEXT", kCoral);
 }
 
 void updateBattery() {
@@ -390,17 +460,23 @@ void startHourglass(Face face, uint32_t now) {
   hourglassTimer.running = true;
   hourglassTimer.completed = false;
   hourglassTimer.lastTickMs = now;
+  dropCounter = 0;
+  fireworkUntil = 0;
   Serial.printf("Hourglass %s: %lu seconds\n", faceTitle(face),
                 static_cast<unsigned long>(durationMs / 1000));
   markUiDirty();
 }
 
 void updateTimer() {
+  const uint32_t now = millis();
+  if (fireworkUntil != 0 && static_cast<int32_t>(now - fireworkUntil) >= 0) {
+    fireworkUntil = 0;
+    markUiDirty();
+  }
   if (!hourglassTimer.running) {
     return;
   }
   const uint32_t beforeSeconds = (hourglassTimer.remainingMs + 999) / 1000;
-  const uint32_t now = millis();
   const uint32_t elapsed = now - hourglassTimer.lastTickMs;
   hourglassTimer.lastTickMs = now;
   if (elapsed >= hourglassTimer.remainingMs) {
@@ -408,11 +484,16 @@ void updateTimer() {
     hourglassTimer.remainingMs = 0;
     hourglassTimer.completed = true;
     alertPending = true;
+    fireworkUntil = now + 2500;
     markUiDirty();
     return;
   }
   hourglassTimer.remainingMs -= elapsed;
   if ((hourglassTimer.remainingMs + 999) / 1000 != beforeSeconds) {
+    ++dropCounter;
+    if (dropCounter % 12 == 0) {
+      fireworkUntil = now + 1800;
+    }
     markUiDirty();
   }
 }
@@ -441,6 +522,11 @@ void requestNudge() {
   outgoingNudgePending = true;
   outgoingNudgeType = 1;
   nudgeCooldownUntil = now + 1500;
+  M5.Speaker.begin();
+  M5.Speaker.setVolume(210);
+  M5.Speaker.tone(520, 80, 0, true);
+  delay(100);
+  M5.Speaker.end();
   markUiDirty();
 }
 
@@ -495,7 +581,10 @@ void updateOrientation(bool foreground) {
   }
   if (stableFace != detected) {
     stableFace = detected;
-    startHourglass(detected, now);
+    hourglassFace = detected;
+    resetTimer(hourglassTimer, 0);
+    dropCounter = 0;
+    fireworkUntil = 0;
   }
 }
 
@@ -569,6 +658,8 @@ void resetRuntime() {
   candidateSinceMs = 0;
   outgoingNudgePending = false;
   motionPeakCount = 0;
+  dropCounter = 0;
+  fireworkUntil = 0;
   alertPending = false;
 }
 
@@ -582,11 +673,42 @@ void setPowerContext(bool wifi, bool monitorOnly) {
 }
 
 void handleAShortPress() {
-  page = static_cast<Page>((static_cast<uint8_t>(page) + 1) % 3);
-  if (page == Page::Hourglass) {
-    stableFace = Face::Unknown;
-    candidateFace = Face::Unknown;
-    candidateSinceMs = 0;
+  if (page == Page::Battery) {
+    ++countValue;
+    preferences.putULong("count", countValue);
+    M5.Speaker.begin();
+    M5.Speaker.setVolume(220);
+    M5.Speaker.tone(220, 110, 0, true);
+    delay(130);
+    M5.Speaker.end();
+  } else if (page == Page::Hourglass) {
+    const Face face = hourglassFace == Face::Unknown ? stableFace : hourglassFace;
+    const uint32_t durationMs = faceDurationMs(face);
+    if (durationMs == 0) {
+      markUiDirty();
+      draw(true);
+      return;
+    }
+    if (hourglassTimer.running) {
+      hourglassTimer.running = false;
+    } else {
+      if (hourglassTimer.remainingMs == 0 || hourglassTimer.completed) {
+        hourglassTimer.totalMs = durationMs;
+        hourglassTimer.remainingMs = durationMs;
+        hourglassTimer.completed = false;
+        dropCounter = 0;
+        fireworkUntil = 0;
+      }
+      hourglassTimer.running = true;
+      hourglassTimer.lastTickMs = millis();
+    }
+    M5.Speaker.begin();
+    M5.Speaker.setVolume(190);
+    M5.Speaker.tone(hourglassTimer.running ? 660 : 420, 75, 0, true);
+    delay(95);
+    M5.Speaker.end();
+  } else {
+    requestNudge();
   }
   motionPeakCount = 0;
   markUiDirty();
@@ -594,41 +716,24 @@ void handleAShortPress() {
 }
 
 void handleALongPress() {
-  if (page != Page::Hourglass || hourglassTimer.remainingMs == 0 ||
-      hourglassTimer.completed) {
-    return;
-  }
-  hourglassTimer.running = !hourglassTimer.running;
-  hourglassTimer.lastTickMs = millis();
-  markUiDirty();
+  // LifeTime uses a short A press for the current action. Long A is reserved
+  // by the global input state machine for EchoLink PTT.
 }
 
 void handleBShortPress() {
-  if (page == Page::Battery) {
-    ++countValue;
-    preferences.putULong("count", countValue);
-  } else if (page == Page::Together) {
-    requestNudge();
-  }
-  markUiDirty();
-}
-
-void handleBLongPress() {
-  if (page == Page::Battery) {
-    countValue = 0;
-    preferences.putULong("count", countValue);
-  } else if (page == Page::Hourglass) {
-    resetTimer(hourglassTimer, 0);
+  page = static_cast<Page>((static_cast<uint8_t>(page) + 1) % 3);
+  if (page == Page::Hourglass) {
     stableFace = Face::Unknown;
     hourglassFace = Face::Unknown;
     candidateFace = Face::Unknown;
-  } else if (page == Page::Together) {
-    nudgeSentCount = 0;
-    nudgeReceivedCount = 0;
-    preferences.putULong("nudges_tx", 0);
-    preferences.putULong("nudges_rx", 0);
+    candidateSinceMs = 0;
   }
   markUiDirty();
+  draw(true);
+}
+
+void handleBLongPress() {
+  handleBShortPress();
 }
 
 bool takeAlert() {
