@@ -7,12 +7,15 @@
 #include <math.h>
 
 #include "LifeTimeConfig.h"
+#include "generated/woodblock_soft_cc0.h"
 
 namespace lifetime {
 namespace {
 
 constexpr uint32_t kBatteryRefreshMs = 60000;
 constexpr uint32_t kPulseRefreshMs = 1000;
+constexpr uint32_t kHourglassFrameMs = 450;
+constexpr uint32_t kMeritEffectMs = 1400;
 
 constexpr uint16_t kBackground = 0x0862;
 constexpr uint16_t kSurface = 0x18E4;
@@ -29,6 +32,9 @@ constexpr uint16_t kBlue = 0x4D9F;
 constexpr uint16_t kPurple = 0xA81F;
 constexpr uint16_t kGlass = 0xB67B;
 constexpr uint16_t kFrame = 0xB30D;
+constexpr uint16_t kOceanDeep = 0x02B8;
+constexpr uint16_t kOceanMid = 0x04FF;
+constexpr uint16_t kOceanLight = 0x7DFF;
 
 enum class Page : uint8_t {
   Battery,
@@ -48,16 +54,24 @@ enum class Face : int8_t {
 
 struct TimerState {
   uint32_t remainingMs = 0;
+  uint32_t reverseMs = 0;
   uint32_t totalMs = 0;
   uint32_t lastTickMs = 0;
   bool running = false;
   bool completed = false;
 };
 
+enum class HourglassMode : uint8_t {
+  Countdown,
+  Rewind,
+};
+
 struct Point {
   int16_t x;
   int16_t y;
 };
+
+Face oppositeFace(Face face);
 
 Preferences preferences;
 M5Canvas canvas(&M5.Display);
@@ -75,6 +89,7 @@ bool uiDirty = true;
 bool alertPending = false;
 Face stableFace = Face::Unknown;
 Face hourglassFace = Face::Unknown;
+Face hourglassAnchorFace = Face::Unknown;
 Face candidateFace = Face::Unknown;
 uint32_t candidateSinceMs = 0;
 uint32_t lastBatteryReadMs = 0;
@@ -83,6 +98,13 @@ uint32_t lastUiDrawMs = 0;
 uint32_t animationFrame = 0;
 uint32_t dropCounter = 0;
 uint32_t fireworkUntil = 0;
+HourglassMode hourglassMode = HourglassMode::Countdown;
+float swayOffsetPx = 0.0f;
+float swayKickPx = 0.0f;
+float swayEnergy = 0.0f;
+float lastAccelX = 0.0f;
+bool haveAccelSample = false;
+uint32_t meritUntil = 0;
 
 bool outgoingNudgePending = false;
 uint8_t outgoingNudgeType = 1;
@@ -122,8 +144,8 @@ void markUiDirty() {
 }
 
 uint32_t faceDurationMs(Face face) {
-  const int index = static_cast<int>(face);
-  return index < 0 || index >= 6 ? 0 : LIFETIME_FACE_DURATION_SECONDS[index] * 1000UL;
+  (void)face;
+  return LIFETIME_FACE_DURATION_SECONDS[0] * 1000UL;
 }
 
 void formatDuration(uint32_t remainingMs, char* buffer, size_t bufferSize) {
@@ -149,6 +171,7 @@ void drawCentered(const String& text, int16_t y, uint8_t size, uint16_t color = 
 }
 
 void drawHeader(uint16_t accent) {
+  canvas.setFont(&fonts::Font0);
   canvas.fillScreen(kBackground);
   canvas.fillRoundRect(8, 10, 4, 16, 2, accent);
   canvas.setTextDatum(textdatum_t::middle_left);
@@ -179,6 +202,25 @@ void drawWoodenFish(int16_t cx, int16_t cy) {
   canvas.drawArc(cx - 1, cy + 1, 15, 8, 15, 165, kYellow);
   canvas.drawLine(cx + 17, cy - 16, cx + 27, cy - 27, kYellow);
   canvas.fillCircle(cx + 28, cy - 28, 3, kYellow);
+}
+
+void drawMeritEffect() {
+  if (meritUntil == 0) {
+    return;
+  }
+  const uint32_t now = millis();
+  if (static_cast<int32_t>(meritUntil - now) <= 0) {
+    return;
+  }
+  const uint32_t age = kMeritEffectMs - (meritUntil - now);
+  const int16_t y = 158 - static_cast<int16_t>(age / 28);
+  const uint16_t color = age < 450 ? kYellow : age < 950 ? kPink : kMint;
+  canvas.setFont(&fonts::efontCN_16_b);
+  canvas.setTextDatum(textdatum_t::middle_center);
+  canvas.setTextColor(color, kBackground);
+  canvas.setTextSize(1);
+  canvas.drawString("功德 +1", 66, y);
+  canvas.setFont(&fonts::Font0);
 }
 
 void drawBatteryPage() {
@@ -221,42 +263,8 @@ void drawBatteryPage() {
   canvas.setTextColor(kWhite, kBackground);
   canvas.setTextSize(countValue > 999999 ? 2 : 3);
   canvas.drawString(String(countValue), 119, 166);
+  drawMeritEffect();
   drawFooter("A HIT", "B NEXT", kMint);
-}
-
-float faceAngle(Face face) {
-  switch (face) {
-    case Face::Right: return 90.0f;
-    case Face::Left: return -90.0f;
-    case Face::ScreenDown:
-    case Face::Bottom: return 180.0f;
-    default: return 0.0f;
-  }
-}
-
-Point rotatePoint(int16_t x, int16_t y, float angleDegrees) {
-  constexpr int16_t cx = 67;
-  constexpr int16_t cy = 105;
-  const float radians = angleDegrees * DEG_TO_RAD;
-  const float dx = x - cx;
-  const float dy = y - cy;
-  return {static_cast<int16_t>(lroundf(cx + dx * cosf(radians) - dy * sinf(radians))),
-          static_cast<int16_t>(lroundf(cy + dx * sinf(radians) + dy * cosf(radians)))};
-}
-
-void drawRotatedLine(int16_t x1, int16_t y1, int16_t x2, int16_t y2, float angle,
-                     uint16_t color) {
-  const Point a = rotatePoint(x1, y1, angle);
-  const Point b = rotatePoint(x2, y2, angle);
-  canvas.drawLine(a.x, a.y, b.x, b.y, color);
-}
-
-void fillRotatedTriangle(int16_t x1, int16_t y1, int16_t x2, int16_t y2, int16_t x3,
-                         int16_t y3, float angle, uint16_t color) {
-  const Point a = rotatePoint(x1, y1, angle);
-  const Point b = rotatePoint(x2, y2, angle);
-  const Point c = rotatePoint(x3, y3, angle);
-  canvas.fillTriangle(a.x, a.y, b.x, b.y, c.x, c.y, color);
 }
 
 uint32_t shapeSeed(uint32_t value) {
@@ -272,30 +280,39 @@ uint16_t shapeColor(uint32_t seed) {
   return colors[seed % (sizeof(colors) / sizeof(colors[0]))];
 }
 
-void drawRotatedCircle(int16_t x, int16_t y, int16_t radius, float angle, uint16_t color) {
-  const Point point = rotatePoint(x, y, angle);
-  canvas.fillCircle(point.x, point.y, radius, color);
+uint16_t blend565(uint16_t first, uint16_t second, float amount) {
+  amount = constrain(amount, 0.0f, 1.0f);
+  const uint8_t r1 = (first >> 11) & 0x1F;
+  const uint8_t g1 = (first >> 5) & 0x3F;
+  const uint8_t b1 = first & 0x1F;
+  const uint8_t r2 = (second >> 11) & 0x1F;
+  const uint8_t g2 = (second >> 5) & 0x3F;
+  const uint8_t b2 = second & 0x1F;
+  return (static_cast<uint16_t>(r1 + (r2 - r1) * amount) << 11) |
+         (static_cast<uint16_t>(g1 + (g2 - g1) * amount) << 5) |
+         static_cast<uint16_t>(b1 + (b2 - b1) * amount);
 }
 
-void drawShape(int16_t x, int16_t y, uint8_t shape, float angle, uint16_t color) {
+void drawShape(int16_t x, int16_t y, uint8_t shape, uint16_t color) {
   switch (shape % 4) {
     case 0:
-      drawRotatedCircle(x, y, 2, angle, color);
+      canvas.fillCircle(x, y, 2, color);
       break;
     case 1:
-      fillRotatedTriangle(x, y - 5, x - 5, y + 3, x + 5, y + 3, angle, color);
-      fillRotatedTriangle(x, y + 5, x - 5, y - 3, x + 5, y - 3, angle, color);
+      canvas.fillTriangle(x, y - 4, x - 4, y + 2, x + 4, y + 2, color);
+      canvas.fillTriangle(x, y + 4, x - 4, y - 2, x + 4, y - 2, color);
       break;
     case 2:
-      drawRotatedLine(x, y - 6, x, y + 6, angle, color);
-      drawRotatedLine(x - 6, y, x + 6, y, angle, color);
-      drawRotatedLine(x - 4, y - 4, x + 4, y + 4, angle, color);
-      drawRotatedLine(x - 4, y + 4, x + 4, y - 4, angle, color);
+      canvas.drawLine(x, y - 5, x, y + 5, color);
+      canvas.drawLine(x - 5, y, x + 5, y, color);
+      canvas.drawLine(x - 3, y - 3, x + 3, y + 3, color);
+      canvas.drawLine(x - 3, y + 3, x + 3, y - 3, color);
       break;
     default:
-      drawRotatedCircle(x - 3, y - 2, 3, angle, color);
-      drawRotatedCircle(x + 3, y - 2, 3, angle, color);
-      fillRotatedTriangle(x - 7, y - 1, x + 7, y - 1, x, y + 8, angle, color);
+      // The heart is intentionally small so the flowing motion stays light.
+      canvas.fillCircle(x - 2, y - 1, 2, color);
+      canvas.fillCircle(x + 2, y - 1, 2, color);
+      canvas.fillTriangle(x - 5, y, x + 5, y, x, y + 6, color);
       break;
   }
 }
@@ -312,51 +329,107 @@ void drawFireworks() {
   }
 }
 
-void drawHourglass() {
+int16_t chamberHalf(int16_t y, bool topChamber) {
+  constexpr int16_t top = 38;
+  constexpr int16_t neck = 103;
+  constexpr int16_t bottom = 168;
+  constexpr int16_t neckHalf = 5;
+  constexpr int16_t outerHalf = 42;
+  const int16_t start = topChamber ? top : neck;
+  const int16_t end = topChamber ? neck : bottom;
+  const float progress = constrain(static_cast<float>(y - start) / (end - start), 0.0f, 1.0f);
+  return topChamber ? static_cast<int16_t>(outerHalf - (outerHalf - neckHalf) * progress)
+                    : static_cast<int16_t>(neckHalf + (outerHalf - neckHalf) * progress);
+}
+
+void drawSandChamber(bool topChamber, float fill, float sway, uint32_t seed) {
   constexpr int16_t cx = 67;
-  constexpr int16_t top = 51;
-  constexpr int16_t neck = 105;
-  constexpr int16_t bottom = 159;
-  constexpr int16_t half = 31;
-  const float angle = faceAngle(hourglassFace == Face::Unknown ? stableFace : hourglassFace);
-
-  for (int8_t thickness = -2; thickness <= 2; ++thickness) {
-    drawRotatedLine(cx - half - 4, top + thickness, cx + half + 4, top + thickness, angle,
-                    kFrame);
-    drawRotatedLine(cx - half - 4, bottom + thickness, cx + half + 4, bottom + thickness,
-                    angle, kFrame);
+  constexpr int16_t neck = 103;
+  constexpr int16_t top = 38;
+  constexpr int16_t bottom = 168;
+  fill = constrain(fill, 0.0f, 1.0f);
+  if (fill <= 0.01f) {
+    return;
   }
-  drawRotatedLine(cx - half, top + 3, cx - 3, neck - 3, angle, kGlass);
-  drawRotatedLine(cx + half, top + 3, cx + 3, neck - 3, angle, kGlass);
-  drawRotatedLine(cx - 3, neck + 3, cx - half, bottom - 3, angle, kGlass);
-  drawRotatedLine(cx + 3, neck + 3, cx + half, bottom - 3, angle, kGlass);
-
-  const float fraction = hourglassTimer.totalMs == 0
-                             ? 0.0f
-                             : min(1.0f, static_cast<float>(hourglassTimer.remainingMs) /
-                                             static_cast<float>(hourglassTimer.totalMs));
-  if (fraction > 0.01f) {
-    const int16_t sandY = neck - 5 - static_cast<int16_t>(42.0f * fraction);
-    const int16_t sandHalf = static_cast<int16_t>(3 + 25.0f * fraction);
-    fillRotatedTriangle(cx - sandHalf, sandY, cx + sandHalf, sandY, cx, neck - 5, angle,
-                        kYellow);
-  }
-  const float fallen = 1.0f - fraction;
-  if (hourglassTimer.totalMs != 0 && fallen > 0.01f) {
-    const int16_t sandY = bottom - 6 - static_cast<int16_t>(40.0f * fallen);
-    fillRotatedTriangle(cx, sandY, cx - 27, bottom - 6, cx + 27, bottom - 6, angle, kYellow);
-    const uint8_t shapeCount = min<uint8_t>(10, 1 + static_cast<uint8_t>(fallen * 10.0f));
-    for (uint8_t i = 0; i < shapeCount; ++i) {
-      const uint32_t seed = shapeSeed(dropCounter * 37UL + i * 101UL + 11UL);
-      const int16_t x = cx - 22 + static_cast<int16_t>(seed % 45);
-      const int16_t y = bottom - 9 - static_cast<int16_t>((seed >> 8) % 28);
-      drawShape(x, y, static_cast<uint8_t>(seed >> 16), angle, shapeColor(seed));
+  const int16_t chamberHeight = topChamber ? neck - top : bottom - neck;
+  const int16_t filledHeight = max<int16_t>(2, static_cast<int16_t>(chamberHeight * fill));
+  const int16_t firstY = topChamber ? neck - filledHeight : neck + 4;
+  const int16_t lastY = topChamber ? neck - 4 : neck + filledHeight;
+  for (int16_t y = firstY; y <= lastY; y += 3) {
+    const float chamberProgress = topChamber
+                                      ? static_cast<float>(neck - y) / chamberHeight
+                                      : static_cast<float>(y - neck) / chamberHeight;
+    const int16_t half = chamberHalf(y, topChamber);
+    const float wave = sinf(static_cast<float>(y) * 0.19f + animationFrame * 0.24f + seed) *
+                       (1.0f + sway * 3.0f);
+    const int16_t offset = static_cast<int16_t>(sway * 8.0f + wave);
+    const int16_t left = cx - half + offset;
+    const int16_t width = max<int16_t>(2, half * 2 - 2);
+    const float gradient = topChamber ? chamberProgress : 1.0f - chamberProgress;
+    const uint16_t color = gradient < 0.5f
+                               ? blend565(kOceanDeep, kOceanMid, gradient * 2.0f)
+                               : blend565(kOceanMid, kOceanLight, (gradient - 0.5f) * 2.0f);
+    canvas.fillRect(left, y, width, 3, color);
+    if ((y + seed) % 9 == 0) {
+      canvas.drawFastHLine(left + 3, y, max<int16_t>(2, width - 8), kOceanLight);
     }
   }
-  if (hourglassTimer.running && hourglassTimer.remainingMs > 0) {
+}
+
+float hourglassProgress() {
+  if (hourglassTimer.totalMs == 0) {
+    return 0.0f;
+  }
+  return hourglassMode == HourglassMode::Countdown
+             ? min(1.0f, static_cast<float>(hourglassTimer.remainingMs) /
+                              static_cast<float>(hourglassTimer.totalMs))
+             : min(1.0f, static_cast<float>(hourglassTimer.reverseMs) /
+                              static_cast<float>(hourglassTimer.totalMs));
+}
+
+void drawHourglass() {
+  constexpr int16_t cx = 67;
+  constexpr int16_t top = 31;
+  constexpr int16_t neck = 103;
+  constexpr int16_t bottom = 175;
+  constexpr int16_t half = 49;
+
+  for (int8_t thickness = -2; thickness <= 2; ++thickness) {
+    canvas.drawFastHLine(cx - half, top + thickness, half * 2, kFrame);
+    canvas.drawFastHLine(cx - half, bottom + thickness, half * 2, kFrame);
+  }
+  canvas.drawLine(cx - half + 2, top + 4, cx - 5, neck - 4, kGlass);
+  canvas.drawLine(cx + half - 2, top + 4, cx + 5, neck - 4, kGlass);
+  canvas.drawLine(cx - 5, neck + 4, cx - half + 2, bottom - 4, kGlass);
+  canvas.drawLine(cx + 5, neck + 4, cx + half - 2, bottom - 4, kGlass);
+
+  const float progress = hourglassProgress();
+  const float topFill = hourglassMode == HourglassMode::Countdown ? progress : progress;
+  const float bottomFill = 1.0f - progress;
+  drawSandChamber(true, topFill, swayEnergy, 3);
+  drawSandChamber(false, bottomFill, swayEnergy, 17);
+
+  if (hourglassTimer.running && hourglassTimer.totalMs > 0) {
+    const bool flowingUp = hourglassMode == HourglassMode::Rewind;
+    const int16_t streamStart = flowingUp ? neck + 16 : neck - 16;
+    const int16_t streamEnd = flowingUp ? neck + 4 : neck - 4;
+    const int16_t streamX = cx + static_cast<int16_t>(swayOffsetPx * 0.45f) +
+                            static_cast<int16_t>(sinf(animationFrame * 0.7f) * swayEnergy * 5.0f);
+    canvas.drawLine(streamX, streamStart, streamX, streamEnd, kOceanLight);
     const uint32_t seed = shapeSeed(dropCounter * 53UL + animationFrame);
-    const int16_t x = cx - 5 + static_cast<int16_t>(seed % 11);
-    drawShape(x, neck + 7, static_cast<uint8_t>(seed >> 16), angle, shapeColor(seed));
+    const int16_t shapeY = flowingUp ? neck - 21 : neck + 21;
+    drawShape(streamX + static_cast<int16_t>(seed % 5) - 2, shapeY,
+              static_cast<uint8_t>(seed >> 16), kOceanLight);
+  }
+  if (bottomFill > 0.01f) {
+    const uint8_t shapeCount = min<uint8_t>(8, 1 + static_cast<uint8_t>(bottomFill * 8.0f));
+    for (uint8_t i = 0; i < shapeCount; ++i) {
+      const uint32_t seed = shapeSeed(dropCounter * 37UL + i * 101UL + 11UL);
+      const int16_t x = cx - 34 + static_cast<int16_t>(seed % 69);
+      const int16_t y = bottom - 10 - static_cast<int16_t>((seed >> 8) % 22);
+      drawShape(x + static_cast<int16_t>(swayOffsetPx * 0.25f), y,
+                static_cast<uint8_t>(seed >> 16), shapeColor(seed));
+    }
   }
   if (fireworkUntil != 0 && static_cast<int32_t>(fireworkUntil - millis()) > 0) {
     drawFireworks();
@@ -367,15 +440,22 @@ void drawHourglassPage() {
   drawHeader(kCyan);
   drawHourglass();
   char duration[16];
-  formatDuration(hourglassTimer.remainingMs, duration, sizeof(duration));
-  drawCentered(duration, 177, 2);
-  const Face shownFace = hourglassFace == Face::Unknown ? stableFace : hourglassFace;
+  const uint32_t shownMs = hourglassMode == HourglassMode::Countdown
+                               ? hourglassTimer.remainingMs
+                               : hourglassTimer.reverseMs;
+  formatDuration(shownMs, duration, sizeof(duration));
+  drawCentered(hourglassMode == HourglassMode::Rewind ? String("+") + duration : duration, 187, 2);
   const char* status = !imuAvailable ? "IMU NOT FOUND"
-                       : hourglassTimer.completed ? "COMPLETE"
-                       : hourglassTimer.running ? faceTitle(shownFace)
-                       : hourglassTimer.remainingMs > 0 ? "PAUSED"
-                                                       : "TURN AND HOLD";
-  drawCentered(status, 198, 1, !imuAvailable ? kCoral : kCyan);
+                       : hourglassAnchorFace == Face::Unknown ? "HOLD INITIAL SIDE"
+                       : hourglassTimer.completed ? (hourglassMode == HourglassMode::Rewind
+                                                         ? "REWIND DONE" : "COMPLETE")
+                       : hourglassTimer.running ? (hourglassMode == HourglassMode::Rewind
+                                                       ? "TIME REWIND" : "TIME FLOW")
+                       : (hourglassMode == HourglassMode::Rewind ? "PRESS A TO REWIND"
+                                                                  : "PRESS A TO START");
+  drawCentered(status, 202, 1, !imuAvailable ? kCoral
+                                               : hourglassMode == HourglassMode::Rewind ? kOceanLight
+                                                                                         : kCyan);
   drawFooter("A START/PAUSE", "B NEXT", kCyan);
 }
 
@@ -444,6 +524,7 @@ void resetTimer(TimerState& timer, uint32_t durationMs) {
   timer.running = false;
   timer.completed = false;
   timer.remainingMs = durationMs;
+  timer.reverseMs = 0;
   timer.totalMs = durationMs;
   timer.lastTickMs = millis();
   markUiDirty();
@@ -455,8 +536,14 @@ void startHourglass(Face face, uint32_t now) {
     return;
   }
   hourglassFace = face;
+  if (hourglassAnchorFace == Face::Unknown) {
+    hourglassAnchorFace = face;
+  }
+  hourglassMode = face == oppositeFace(hourglassAnchorFace) ? HourglassMode::Rewind
+                                                            : HourglassMode::Countdown;
   hourglassTimer.totalMs = durationMs;
   hourglassTimer.remainingMs = durationMs;
+  hourglassTimer.reverseMs = 0;
   hourglassTimer.running = true;
   hourglassTimer.completed = false;
   hourglassTimer.lastTickMs = now;
@@ -476,20 +563,36 @@ void updateTimer() {
   if (!hourglassTimer.running) {
     return;
   }
-  const uint32_t beforeSeconds = (hourglassTimer.remainingMs + 999) / 1000;
   const uint32_t elapsed = now - hourglassTimer.lastTickMs;
   hourglassTimer.lastTickMs = now;
-  if (elapsed >= hourglassTimer.remainingMs) {
+  bool reachedEnd = false;
+  if (hourglassMode == HourglassMode::Countdown) {
+    if (elapsed >= hourglassTimer.remainingMs) {
+      hourglassTimer.remainingMs = 0;
+      reachedEnd = true;
+    } else {
+      hourglassTimer.remainingMs -= elapsed;
+    }
+  } else {
+    const uint32_t available = hourglassTimer.totalMs - hourglassTimer.reverseMs;
+    if (elapsed >= available) {
+      hourglassTimer.reverseMs = hourglassTimer.totalMs;
+      reachedEnd = true;
+    } else {
+      hourglassTimer.reverseMs += elapsed;
+    }
+  }
+  if (reachedEnd) {
     hourglassTimer.running = false;
-    hourglassTimer.remainingMs = 0;
     hourglassTimer.completed = true;
     alertPending = true;
     fireworkUntil = now + 2500;
     markUiDirty();
     return;
   }
-  hourglassTimer.remainingMs -= elapsed;
-  if ((hourglassTimer.remainingMs + 999) / 1000 != beforeSeconds) {
+  const uint32_t shownMs = hourglassMode == HourglassMode::Countdown
+                               ? hourglassTimer.remainingMs : hourglassTimer.reverseMs;
+  if ((shownMs / 1000) != ((shownMs - min<uint32_t>(elapsed, shownMs)) / 1000)) {
     ++dropCounter;
     if (dropCounter % 12 == 0) {
       fireworkUntil = now + 1800;
@@ -512,6 +615,19 @@ Face classifyFace(float x, float y, float z) {
     return x >= 0.0f ? Face::Right : Face::Left;
   }
   return y >= 0.0f ? Face::Top : Face::Bottom;
+}
+
+Face oppositeFace(Face face) {
+  switch (face) {
+    case Face::ScreenUp: return Face::ScreenDown;
+    case Face::ScreenDown: return Face::ScreenUp;
+    case Face::Right: return Face::Left;
+    case Face::Left: return Face::Right;
+    case Face::Top: return Face::Bottom;
+    case Face::Bottom: return Face::Top;
+    case Face::Unknown: return Face::Unknown;
+  }
+  return Face::Unknown;
 }
 
 void requestNudge() {
@@ -565,6 +681,17 @@ void updateOrientation(bool foreground) {
   if (!M5.Imu.getAccel(&x, &y, &z)) {
     return;
   }
+  if (page == Page::Hourglass) {
+    const float deltaX = haveAccelSample ? x - lastAccelX : 0.0f;
+    swayKickPx = constrain(swayKickPx + deltaX * 22.0f, -14.0f, 14.0f) * 0.82f;
+    swayOffsetPx = constrain(x * 8.0f + swayKickPx, -16.0f, 16.0f);
+    swayEnergy = constrain(swayEnergy * 0.78f + fabsf(deltaX) * 2.4f, 0.0f, 1.0f);
+    if (fabsf(swayOffsetPx) > 0.4f || swayEnergy > 0.03f) {
+      markUiDirty();
+    }
+  }
+  lastAccelX = x;
+  haveAccelSample = true;
   detectNudgeGesture(x, y, z);
   if (page != Page::Hourglass) {
     return;
@@ -580,18 +707,44 @@ void updateOrientation(bool foreground) {
     return;
   }
   if (stableFace != detected) {
+    const bool wasRunning = hourglassTimer.running;
+    const uint32_t totalMs = hourglassTimer.totalMs;
+    const uint32_t currentProgress = totalMs == 0
+                                        ? 0
+                                        : hourglassMode == HourglassMode::Countdown
+                                              ? totalMs - hourglassTimer.remainingMs
+                                              : hourglassTimer.reverseMs;
     stableFace = detected;
     hourglassFace = detected;
-    resetTimer(hourglassTimer, 0);
+    if (hourglassAnchorFace == Face::Unknown) {
+      hourglassAnchorFace = detected;
+    }
+    hourglassMode = detected == oppositeFace(hourglassAnchorFace)
+                        ? HourglassMode::Rewind : HourglassMode::Countdown;
+    if (totalMs == 0) {
+      resetTimer(hourglassTimer, 0);
+    } else if (hourglassMode == HourglassMode::Rewind) {
+      hourglassTimer.reverseMs = currentProgress;
+      hourglassTimer.completed = hourglassTimer.reverseMs >= totalMs;
+    } else {
+      hourglassTimer.remainingMs = totalMs > currentProgress ? totalMs - currentProgress : 0;
+      hourglassTimer.completed = hourglassTimer.remainingMs == 0;
+    }
+    hourglassTimer.running = wasRunning && !hourglassTimer.completed;
+    hourglassTimer.lastTickMs = now;
     dropCounter = 0;
     fireworkUntil = 0;
+    markUiDirty();
   }
 }
 
 bool animatedNow(uint32_t now) {
-  return page == Page::Together &&
-         (outgoingNudgePending || now - lastNudgeSentAt < 1200 ||
-          now - lastNudgeReceivedAt < 1800);
+  return (page == Page::Together &&
+          (outgoingNudgePending || now - lastNudgeSentAt < 1200 ||
+           now - lastNudgeReceivedAt < 1800)) ||
+         (page == Page::Hourglass &&
+          (hourglassTimer.running || swayEnergy > 0.03f)) ||
+         (page == Page::Battery && meritUntil != 0);
 }
 
 }  // namespace
@@ -623,6 +776,10 @@ void update(bool foreground) {
   updateBattery();
   updateOrientation(true);
   updateTimer();
+  if (meritUntil != 0 && static_cast<int32_t>(millis() - meritUntil) >= 0) {
+    meritUntil = 0;
+    markUiDirty();
+  }
 }
 
 void draw(bool force) {
@@ -634,7 +791,9 @@ void draw(bool force) {
   if (!force && !uiDirty && !animated) {
     return;
   }
-  if (!force && animated && now - lastUiDrawMs < kPulseRefreshMs) {
+  const uint32_t frameInterval = page == Page::Hourglass ? kHourglassFrameMs :
+                                 page == Page::Battery ? 140 : kPulseRefreshMs;
+  if (!force && animated && now - lastUiDrawMs < frameInterval) {
     return;
   }
   ++animationFrame;
@@ -652,8 +811,10 @@ void draw(bool force) {
 
 void resetRuntime() {
   resetTimer(hourglassTimer, 0);
+  hourglassMode = HourglassMode::Countdown;
   stableFace = Face::Unknown;
   hourglassFace = Face::Unknown;
+  hourglassAnchorFace = Face::Unknown;
   candidateFace = Face::Unknown;
   candidateSinceMs = 0;
   outgoingNudgePending = false;
@@ -661,6 +822,11 @@ void resetRuntime() {
   dropCounter = 0;
   fireworkUntil = 0;
   alertPending = false;
+  swayOffsetPx = 0.0f;
+  swayKickPx = 0.0f;
+  swayEnergy = 0.0f;
+  haveAccelSample = false;
+  meritUntil = 0;
 }
 
 void setPowerContext(bool wifi, bool monitorOnly) {
@@ -676,10 +842,14 @@ void handleAShortPress() {
   if (page == Page::Battery) {
     ++countValue;
     preferences.putULong("count", countValue);
+    meritUntil = millis() + kMeritEffectMs;
     M5.Speaker.begin();
-    M5.Speaker.setVolume(220);
-    M5.Speaker.tone(220, 110, 0, true);
-    delay(130);
+    M5.Speaker.setVolume(235);
+    M5.Speaker.playRaw(assets_audio_woodblock_soft_cc0_raw,
+                       assets_audio_woodblock_soft_cc0_raw_len, 16000, false, 1, 0, false);
+    while (M5.Speaker.isPlaying()) {
+      delay(2);
+    }
     M5.Speaker.end();
   } else if (page == Page::Hourglass) {
     const Face face = hourglassFace == Face::Unknown ? stableFace : hourglassFace;
@@ -692,9 +862,12 @@ void handleAShortPress() {
     if (hourglassTimer.running) {
       hourglassTimer.running = false;
     } else {
-      if (hourglassTimer.remainingMs == 0 || hourglassTimer.completed) {
+      if ((hourglassMode == HourglassMode::Countdown && hourglassTimer.remainingMs == 0) ||
+          (hourglassMode == HourglassMode::Rewind && hourglassTimer.reverseMs >= durationMs) ||
+          hourglassTimer.completed) {
         hourglassTimer.totalMs = durationMs;
         hourglassTimer.remainingMs = durationMs;
+        hourglassTimer.reverseMs = 0;
         hourglassTimer.completed = false;
         dropCounter = 0;
         fireworkUntil = 0;
@@ -723,10 +896,16 @@ void handleALongPress() {
 void handleBShortPress() {
   page = static_cast<Page>((static_cast<uint8_t>(page) + 1) % 3);
   if (page == Page::Hourglass) {
+    hourglassMode = HourglassMode::Countdown;
     stableFace = Face::Unknown;
     hourglassFace = Face::Unknown;
+    hourglassAnchorFace = Face::Unknown;
     candidateFace = Face::Unknown;
     candidateSinceMs = 0;
+    swayOffsetPx = 0.0f;
+    swayKickPx = 0.0f;
+    swayEnergy = 0.0f;
+    haveAccelSample = false;
   }
   markUiDirty();
   draw(true);
