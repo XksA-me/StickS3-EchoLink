@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/XksA-me/StickS3-EchoLink/actions"><img alt="Build" src="https://img.shields.io/badge/build-PlatformIO-f5822a"></a>
+  <a href="https://github.com/XksA-me/StickS3-EchoLink/actions/workflows/build.yml"><img alt="Build" src="https://github.com/XksA-me/StickS3-EchoLink/actions/workflows/build.yml/badge.svg"></a>
   <img alt="ESP32-S3" src="https://img.shields.io/badge/SoC-ESP32--S3-e7352c">
   <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue">
 </p>
