@@ -33,8 +33,10 @@ constexpr uint8_t kMqttMaxAttempts = 3;
 constexpr uint32_t kMqttRetryPauseMs = 15000;
 constexpr uint32_t kDisplayDimMs = ECHOLINK_DISPLAY_DIM_SECONDS * 1000UL;
 constexpr uint32_t kDisplayIdleMs = ECHOLINK_DISPLAY_SLEEP_SECONDS * 1000UL;
-constexpr uint32_t kAPlayOrPttThresholdMs = 350;
+constexpr uint32_t kARecordHoldMs = 1000;
+constexpr uint32_t kADoubleClickWindowMs = 350;
 constexpr uint32_t kDiagnosticIntervalMs = 30000;
+constexpr uint32_t kDefaultMqttPollMs = 250;
 
 enum class UiState : uint8_t {
   Ready,
@@ -71,6 +73,7 @@ struct NetworkSettings {
   String mqttUser;
   String mqttPassword;
   String mqttTopic = "echolink/v1/voice";
+  uint32_t mqttPollMs = kDefaultMqttPollMs;
 };
 
 struct WiFiProfile {
@@ -189,18 +192,22 @@ uint8_t setupInfoPage = 0;
 uint32_t lastSetupInfoChange = 0;
 bool displaySleeping = false;
 bool displayDimmed = false;
+bool monitorOnly = false;
 uint32_t lastUserActivity = 0;
-bool aPlayPending = false;
+bool aLongHandled = false;
+bool aClickPending = false;
 uint32_t aPressedAt = 0;
+uint32_t aClickReleasedAt = 0;
+AppMode aClickApp = AppMode::EchoLink;
 uint32_t lastDiagnosticHeartbeat = 0;
 AppMode activeApp = AppMode::EchoLink;
 AppMode launcherSelection = AppMode::EchoLink;
-uint32_t appChordStartedAt = 0;
-bool appChordHandled = false;
 
 void fail(const char* message);
 String deviceSuffix();
 void serviceIncomingTransportFrames(uint8_t budget = 8);
+void startRecording();
+void playNextUnreadVoice();
 
 const char* stateText(UiState state) {
   switch (state) {
@@ -369,7 +376,7 @@ void drawUi(bool force = false) {
   const bool stateChanged = uiState != lastDrawnState;
   const bool messageChanged = strcmp(message, lastDrawnMessage) != 0;
   const bool volumeChanged = volume != lastDrawnVolume;
-  const bool animate = isAnimatedState(uiState) && millis() - lastUiAnimation >= 100;
+  const bool animate = isAnimatedState(uiState) && millis() - lastUiAnimation >= 200;
   if (!force && !stateChanged && !messageChanged && !volumeChanged && !animate) {
     return;
   }
@@ -400,7 +407,7 @@ void drawLauncher() {
 
   const AppMode apps[] = {AppMode::EchoLink, AppMode::LifeTime};
   const char* names[] = {"EchoLink", "LifeTime"};
-  const char* details[] = {"VOICE LINK", "CLOCK & TIMER"};
+  const char* details[] = {"VOICE LINK", "CLOCK"};
   const uint16_t accents[] = {kUiTeal, kUiYellow};
   for (uint8_t i = 0; i < 2; ++i) {
     const int16_t y = 48 + i * 72;
@@ -435,7 +442,7 @@ void enterLauncher() {
   }
   launcherSelection = activeApp;
   activeApp = AppMode::Launcher;
-  aPlayPending = false;
+  aClickPending = false;
   drawLauncher();
 }
 
@@ -450,23 +457,60 @@ void openSelectedApp() {
   }
 }
 
-bool handleAppSwitcherGesture() {
-  const bool bothPressed = M5.BtnA.isPressed() && M5.BtnB.isPressed();
-  if (bothPressed) {
-    if (appChordStartedAt == 0) {
-      appChordStartedAt = millis();
-    }
-    if (!appChordHandled && millis() - appChordStartedAt >= 1200) {
-      appChordHandled = true;
-      enterLauncher();
-    }
-    return true;
+void openAppSwitcher() {
+  if (portalActive || uiState == UiState::Recording || uiState == UiState::Playing) {
+    return;
   }
-  if (!M5.BtnA.isPressed() && !M5.BtnB.isPressed()) {
-    appChordStartedAt = 0;
-    appChordHandled = false;
+  enterLauncher();
+  Serial.println("App switcher opened");
+}
+
+void dispatchAShortClick(AppMode sourceApp) {
+  if (sourceApp != activeApp) {
+    return;
   }
-  return false;
+  if (sourceApp == AppMode::EchoLink) {
+    playNextUnreadVoice();
+  } else if (sourceApp == AppMode::LifeTime) {
+    lifetime::handleAShortPress();
+  } else {
+    openSelectedApp();
+  }
+}
+
+void handleAButton() {
+  const uint32_t now = millis();
+  if (M5.BtnA.wasPressed()) {
+    aPressedAt = now;
+    aLongHandled = false;
+  }
+  if (!aLongHandled && M5.BtnA.isPressed() && now - aPressedAt >= kARecordHoldMs) {
+    aLongHandled = true;
+    aClickPending = false;
+    if (activeApp == AppMode::EchoLink) {
+      startRecording();
+    } else if (activeApp == AppMode::LifeTime) {
+      lifetime::handleALongPress();
+    }
+  }
+  if (M5.BtnA.wasReleased()) {
+    if (aLongHandled) {
+      if (uiState == UiState::Recording) {
+        recordingStopRequested = true;
+      }
+    } else if (aClickPending && now - aClickReleasedAt <= kADoubleClickWindowMs) {
+      aClickPending = false;
+      openAppSwitcher();
+    } else {
+      aClickPending = true;
+      aClickReleasedAt = now;
+      aClickApp = activeApp;
+    }
+  }
+  if (aClickPending && !M5.BtnA.isPressed() && now - aClickReleasedAt > kADoubleClickWindowMs) {
+    aClickPending = false;
+    dispatchAShortClick(aClickApp);
+  }
 }
 
 void wakeDisplay() {
@@ -636,7 +680,7 @@ void acceptIncomingPacket(const uint8_t* data, size_t length) {
   const auto* payload = reinterpret_cast<const int8_t*>(data + sizeof(echolink::PacketHeader));
 
   if (type == echolink::PacketType::Nudge) {
-    if (header.payloadBytes == 1) {
+    if (!monitorOnly && header.payloadBytes == 1) {
       lifetime::receiveNudge(static_cast<uint8_t>(payload[0]), header.senderId);
     }
     return;
@@ -701,14 +745,14 @@ void acceptIncomingPacket(const uint8_t* data, size_t length) {
 
 constexpr uint8_t kEspNowBroadcastAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-bool queueIncomingTransportFrame(const uint8_t* data, size_t length) {
+bool queueIncomingTransportFrame(const uint8_t* data, size_t length, TickType_t waitTicks = 0) {
   if (incomingFrameQueue == nullptr || data == nullptr || length > kMaxTransportFrameBytes) {
     return false;
   }
   TransportFrame frame;
   frame.length = static_cast<uint16_t>(length);
   memcpy(frame.data, data, length);
-  return xQueueSend(incomingFrameQueue, &frame, 0) == pdTRUE;
+  return xQueueSend(incomingFrameQueue, &frame, waitTicks) == pdTRUE;
 }
 
 void serviceIncomingTransportFrames(uint8_t budget) {
@@ -775,7 +819,9 @@ bool initEspNowTransport() {
 
 void onMqttMessage(char* topic, uint8_t* payload, unsigned int length) {
   (void)topic;
-  if (!queueIncomingTransportFrame(payload, length)) {
+  // MQTT can deliver a burst after a long power-saving poll interval. A short
+  // queue wait lets the main core drain frames instead of dropping the burst.
+  if (!queueIncomingTransportFrame(payload, length, pdMS_TO_TICKS(20))) {
     ++droppedPackets;
   }
 }
@@ -797,6 +843,9 @@ bool sendMqttFrame(const uint8_t* data, size_t length) {
   }
   mqttPublishPending = true;
   pendingMqttPublishId = request.id;
+  if (mqttWorkerHandle != nullptr) {
+    xTaskNotifyGive(mqttWorkerHandle);
+  }
   return true;
 }
 
@@ -834,6 +883,16 @@ void saveWiFiProfiles() {
   preferences.putString("wifi_pass", networkSettings.password);
 }
 
+uint32_t normalizeMqttPollMs(uint32_t value) {
+  static constexpr uint32_t kOptions[] = {20, 250, 1000, 5000};
+  for (const uint32_t option : kOptions) {
+    if (value == option) {
+      return value;
+    }
+  }
+  return kDefaultMqttPollMs;
+}
+
 void loadNetworkSettings() {
   wifiProfileCount = min<uint8_t>(preferences.getUChar("wifi_count", 0), kMaxWiFiProfiles);
   for (uint8_t i = 0; i < wifiProfileCount;) {
@@ -862,6 +921,8 @@ void loadNetworkSettings() {
   networkSettings.mqttUser = preferences.getString("mqtt_user", "");
   networkSettings.mqttPassword = preferences.getString("mqtt_pass", "");
   networkSettings.mqttTopic = preferences.getString("mqtt_topic", "echolink/v1/voice");
+  networkSettings.mqttPollMs =
+      normalizeMqttPollMs(preferences.getULong("mqtt_poll", kDefaultMqttPollMs));
   if (networkSettings.mqttTopic.length() == 0) {
     networkSettings.mqttTopic = "echolink/v1/voice";
   }
@@ -1053,7 +1114,18 @@ String configPage() {
   page += F("'></label><label>MQTT password<input type=password name=mqtt_pass placeholder='unchanged when blank'></label>"
             "<label>Topic<input name=mqtt_topic value='");
   page += htmlEscape(networkSettings.mqttTopic);
-  page += F("'></label><button>Save and connect</button></form></main></body></html>");
+  page += F("'></label><label>消息检查频率 / Message check<select name=mqtt_poll>"
+            "<option value=20");
+  page += networkSettings.mqttPollMs == 20 ? F(" selected>") : F(">");
+  page += F("实时 / Realtime (20 ms)</option><option value=250");
+  page += networkSettings.mqttPollMs == 250 ? F(" selected>") : F(">");
+  page += F("均衡 / Balanced (250 ms)</option><option value=1000");
+  page += networkSettings.mqttPollMs == 1000 ? F(" selected>") : F(">");
+  page += F("省电 / Power save (1 s)</option><option value=5000");
+  page += networkSettings.mqttPollMs == 5000 ? F(" selected>") : F(">");
+  page += F("最长续航 / Maximum saving (5 s)</option></select></label>"
+            "<p class=hint>连接会保持在线；更长间隔会延迟提示，但可减少 CPU 唤醒。</p>"
+            "<button>Save and connect</button></form></main></body></html>");
   return page;
 }
 
@@ -1127,6 +1199,8 @@ void ensureConfigServer() {
     if (networkSettings.mqttTopic.length() == 0) {
       networkSettings.mqttTopic = "echolink/v1/voice";
     }
+    networkSettings.mqttPollMs =
+        normalizeMqttPollMs(static_cast<uint32_t>(configServer.arg("mqtt_poll").toInt()));
     const String wifiPassword = configServer.arg("wifi_pass");
     const String mqttPassword = configServer.arg("mqtt_pass");
     if (selectedProfile >= 0 && selectedProfile < wifiProfileCount) {
@@ -1148,6 +1222,7 @@ void ensureConfigServer() {
     preferences.putString("mqtt_user", networkSettings.mqttUser);
     preferences.putString("mqtt_pass", networkSettings.mqttPassword);
     preferences.putString("mqtt_topic", networkSettings.mqttTopic);
+    preferences.putULong("mqtt_poll", networkSettings.mqttPollMs);
     preferences.putUChar("mode", static_cast<uint8_t>(activeTransport));
     configServer.sendHeader("Cache-Control", "no-store, max-age=0");
     configServer.send(200, "text/html; charset=utf-8",
@@ -1187,6 +1262,9 @@ void startConfigPortal() {
     espNowActive = false;
   }
   mqttWorkerEnabled = false;
+  if (mqttWorkerHandle != nullptr) {
+    xTaskNotifyGive(mqttWorkerHandle);
+  }
   mqttReady = false;
   ++mqttTransportGeneration;
   mqttPublishPending = false;
@@ -1220,6 +1298,9 @@ bool initMqttTransport() {
   lastWiFiStatus = WL_NO_SHIELD;
   lastMqttState = 99;
   mqttWorkerEnabled = true;
+  if (mqttWorkerHandle != nullptr) {
+    xTaskNotifyGive(mqttWorkerHandle);
+  }
   snprintf(lastResult, sizeof(lastResult), "WiFi connecting");
   Serial.printf("WiFi connecting to '%s'; MQTT %s:%u topic %s\n",
                 networkSettings.ssid.c_str(), networkSettings.mqttHost.c_str(),
@@ -1368,7 +1449,16 @@ void mqttWorkerTask(void*) {
       continue;
     }
 
-    if (!mqttClient.loop()) {
+    bool mqttLoopHealthy = true;
+    const uint32_t drainStartedAt = millis();
+    do {
+      mqttLoopHealthy = mqttClient.loop();
+      if (!mqttLoopHealthy) {
+        break;
+      }
+      taskYIELD();
+    } while (wifiClient.available() > 0 && millis() - drainStartedAt < 100);
+    if (!mqttLoopHealthy) {
       mqttWorkerState = mqttClient.state();
       mqttReady = false;
       disableWiFiPowerSaveAfterLinkLoss();
@@ -1396,7 +1486,12 @@ void mqttWorkerTask(void*) {
       }
       xQueueSend(mqttPublishResultQueue, &result, 0);
     }
-    vTaskDelay(pdMS_TO_TICKS(hadPublishRequest ? 2 : 10));
+    const bool incomingBacklog = wifiClient.available() > 0;
+    if (hadPublishRequest || incomingBacklog) {
+      vTaskDelay(pdMS_TO_TICKS(2));
+    } else {
+      ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(networkSettings.mqttPollMs));
+    }
   }
 }
 
@@ -1411,6 +1506,9 @@ bool initTransport() {
     espNowActive = false;
   }
   mqttWorkerEnabled = false;
+  if (mqttWorkerHandle != nullptr) {
+    xTaskNotifyGive(mqttWorkerHandle);
+  }
   mqttReady = false;
   ++mqttTransportGeneration;
   mqttPublishPending = false;
@@ -1428,8 +1526,10 @@ bool initTransport() {
 }
 
 void maintainTransport() {
-  ensureConfigServer();
-  configServer.handleClient();
+  if (!monitorOnly) {
+    ensureConfigServer();
+    configServer.handleClient();
+  }
   if (restartTransportRequested &&
       (configSaveUntil == 0 || static_cast<int32_t>(millis() - configSaveUntil) >= 0)) {
     restartTransportRequested = false;
@@ -1467,7 +1567,7 @@ void maintainTransport() {
     snprintf(lastResult, sizeof(lastResult), "%s", wifiStatusMessage(wifiStatus));
     return;
   }
-  if (!mdnsActive) {
+  if (!monitorOnly && !mdnsActive) {
     const String hostname = "echolink-" + deviceSuffix();
     if (MDNS.begin(hostname.c_str())) {
       MDNS.addService("http", "tcp", 80);
@@ -1748,8 +1848,10 @@ void playNewVoiceAlert() {
   stopAudio();
   snprintf(lastResult, sizeof(lastResult), "NEW MSG %u", unreadVoiceCount);
   uiState = UiState::Ready;
-  wakeDisplay();
-  drawUi(true);
+  if (!monitorOnly) {
+    wakeDisplay();
+    drawUi(true);
+  }
 }
 
 void playNextUnreadVoice() {
@@ -1808,6 +1910,56 @@ void toggleTransport() {
   drawUi(true);
 }
 
+void setMonitorOnly(bool enabled) {
+  if (monitorOnly == enabled) {
+    return;
+  }
+  if (enabled) {
+    if (uiState == UiState::Recording) {
+      queueRecordedVoice();
+    } else {
+      stopAudio();
+    }
+    if (portalActive) {
+      stopConfigPortal();
+      uiState = UiState::Ready;
+      restartTransportRequested = true;
+    }
+    if (mdnsActive) {
+      MDNS.end();
+      mdnsActive = false;
+    }
+    monitorOnly = true;
+    aClickPending = false;
+    lifetime::resetRuntime();
+    lifetime::setPowerContext(activeTransport == TransportMode::WiFi, true);
+    M5.Power.setLed(0);
+    M5.Display.setBrightness(0);
+    M5.Display.sleep();
+    displaySleeping = true;
+    displayDimmed = false;
+    Serial.println("Monitor-only mode enabled");
+    return;
+  }
+
+  monitorOnly = false;
+  lifetime::setPowerContext(activeTransport == TransportMode::WiFi, false);
+  M5.Power.setLed(0);
+  M5.Display.wakeup();
+  M5.Display.setBrightness(ECHOLINK_DISPLAY_BRIGHTNESS);
+  displaySleeping = false;
+  displayDimmed = false;
+  lastUserActivity = millis();
+  if (activeApp == AppMode::LifeTime) {
+    lifetime::draw(true);
+  } else if (activeApp == AppMode::Launcher) {
+    drawLauncher();
+  } else {
+    drawUi(true);
+  }
+  Serial.println("Monitor-only mode disabled");
+}
+
 void handleSerialCommand() {
   if (Serial.available() == 0) {
     return;
@@ -1854,15 +2006,17 @@ void setup() {
   M5.Display.setRotation(0);
   M5.Display.setTextDatum(textdatum_t::top_left);
   M5.Display.setBrightness(ECHOLINK_DISPLAY_BRIGHTNESS);
+  M5.Power.setLed(0);
 
   deviceId = static_cast<uint32_t>(ESP.getEfuseMac());
   preferences.begin("echolink", false);
   loadNetworkSettings();
   activeApp = preferences.getUChar("app", 0) == 1 ? AppMode::LifeTime : AppMode::EchoLink;
   launcherSelection = activeApp;
-  M5.BtnA.setHoldThresh(900);
+  M5.BtnA.setHoldThresh(kARecordHoldMs);
   M5.BtnB.setHoldThresh(900);
   lifetime::begin();
+  lifetime::setPowerContext(activeTransport == TransportMode::WiFi, false);
   txAudio = static_cast<int8_t*>(ps_malloc(kMaxAudioBytes));
   rxAudio = static_cast<int8_t*>(ps_malloc(kMaxAudioBytes));
   rxChunkSeen = static_cast<bool*>(ps_malloc(kMaxChunks * sizeof(bool)));
@@ -1916,12 +2070,32 @@ void setup() {
 void loop() {
   M5.update();
   handleSerialCommand();
+
+  if (M5.BtnPWR.wasSingleClicked()) {
+    setMonitorOnly(!monitorOnly);
+  }
+
+  maintainTransport();
+  serviceIncomingTransportFrames(monitorOnly ? 16 : 8);
+  playNewVoiceAlert();
+
+  if (monitorOnly) {
+    if (millis() - lastDiagnosticHeartbeat >= kDiagnosticIntervalMs) {
+      lastDiagnosticHeartbeat = millis();
+      Serial.printf("HEARTBEAT monitor=1 mode=%s wifi=%d mqtt=%d unread=%u psram=%u\n",
+                    activeTransport == TransportMode::Local ? "LOCAL" : "WIFI",
+                    static_cast<int>(WiFi.status()), mqttReady, unreadVoiceCount,
+                    static_cast<unsigned>(ESP.getFreePsram()));
+    }
+    delay(100);
+    return;
+  }
+
   if (M5.BtnA.wasPressed() || M5.BtnB.wasPressed()) {
     wakeDisplay();
   }
-  const bool appSwitchGestureActive = handleAppSwitcherGesture();
-  maintainTransport();
-  serviceIncomingTransportFrames();
+  handleAButton();
+  lifetime::setPowerContext(activeTransport == TransportMode::WiFi, false);
   lifetime::update(activeApp == AppMode::LifeTime);
   if (millis() - lastDiagnosticHeartbeat >= kDiagnosticIntervalMs) {
     lastDiagnosticHeartbeat = millis();
@@ -1933,7 +2107,6 @@ void loop() {
                   unreadVoiceCount, static_cast<unsigned>(ESP.getFreePsram()));
   }
 
-  playNewVoiceAlert();
   if (uiState == UiState::Ready && !voiceAlertPending && lifetime::takeAlert()) {
     chirp(880);
     chirp(1320);
@@ -1941,20 +2114,11 @@ void loop() {
     wakeDisplay();
   }
 
-  if (appSwitchGestureActive) {
-    serviceBackgroundTransmits();
-    maintainDisplayPower();
-    delay(cooperativeLoopDelayMs());
-    return;
-  }
-
   if (activeApp == AppMode::Launcher) {
     if (M5.BtnB.wasClicked()) {
       launcherSelection = launcherSelection == AppMode::EchoLink ? AppMode::LifeTime
                                                                   : AppMode::EchoLink;
       drawLauncher();
-    } else if (M5.BtnA.wasClicked()) {
-      openSelectedApp();
     }
     serviceBackgroundTransmits();
     maintainDisplayPower();
@@ -1963,11 +2127,6 @@ void loop() {
   }
 
   if (activeApp == AppMode::LifeTime) {
-    if (M5.BtnA.wasReleasedAfterHold()) {
-      lifetime::handleALongPress();
-    } else if (M5.BtnA.wasClicked()) {
-      lifetime::handleAShortPress();
-    }
     if (M5.BtnB.wasReleasedAfterHold()) {
       lifetime::handleBLongPress();
     } else if (M5.BtnB.wasClicked()) {
@@ -2001,30 +2160,8 @@ void loop() {
     return;
   }
 
-  if (uiState == UiState::Ready && M5.BtnA.wasPressed()) {
-    if (unreadVoiceCount > 0) {
-      aPlayPending = true;
-      aPressedAt = millis();
-    } else {
-      startRecording();
-    }
-  }
-
-  if (aPlayPending && M5.BtnA.isPressed() &&
-      millis() - aPressedAt >= kAPlayOrPttThresholdMs) {
-    aPlayPending = false;
-    startRecording();
-  }
-
-  if (aPlayPending && M5.BtnA.wasReleased()) {
-    aPlayPending = false;
-    if (millis() - aPressedAt < kAPlayOrPttThresholdMs) {
-      playNextUnreadVoice();
-    }
-  }
-
   if (uiState == UiState::Recording) {
-    if (!M5.BtnA.isPressed() || txAudioBytes >= kMaxAudioBytes) {
+    if (txAudioBytes >= kMaxAudioBytes) {
       recordingStopRequested = true;
     }
     recordAudioBlock();

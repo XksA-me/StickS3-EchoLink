@@ -8,6 +8,8 @@ void begin();
 void onEnter();
 void update(bool foreground);
 void draw(bool force = false);
+void resetRuntime();
+void setPowerContext(bool wifi, bool monitorOnly);
 
 void handleAShortPress();
 void handleALongPress();

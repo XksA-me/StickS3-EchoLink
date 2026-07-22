@@ -3,21 +3,16 @@
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <Preferences.h>
-#include <WiFi.h>
 
 #include <math.h>
-#include <time.h>
 
 #include "LifeTimeConfig.h"
 
 namespace lifetime {
 namespace {
 
-constexpr uint32_t kBatteryRefreshMs = 5000;
-constexpr uint32_t kAnimatedRefreshMs = 120;
-constexpr uint32_t kStaticRefreshMs = 1000;
-constexpr uint8_t kPresetCount = 7;
-constexpr uint32_t kPresetMinutes[kPresetCount] = {1, 3, 5, 10, 15, 30, 60};
+constexpr uint32_t kBatteryRefreshMs = 15000;
+constexpr uint32_t kPulseRefreshMs = 250;
 
 constexpr uint16_t kBackground = 0x0862;
 constexpr uint16_t kSurface = 0x18E4;
@@ -32,9 +27,8 @@ constexpr uint16_t kGlass = 0xB67B;
 constexpr uint16_t kFrame = 0xB30D;
 
 enum class Page : uint8_t {
-  Now,
-  Focus,
-  Flow,
+  Battery,
+  Hourglass,
   Together,
 };
 
@@ -50,30 +44,35 @@ enum class Face : int8_t {
 
 struct TimerState {
   uint32_t remainingMs = 0;
+  uint32_t totalMs = 0;
   uint32_t lastTickMs = 0;
   bool running = false;
   bool completed = false;
 };
 
+struct Point {
+  int16_t x;
+  int16_t y;
+};
+
 Preferences preferences;
 M5Canvas canvas(&M5.Display);
 bool canvasReady = false;
-Page page = Page::Now;
-TimerState focusTimer;
-TimerState flowTimer;
+Page page = Page::Battery;
+TimerState hourglassTimer;
 uint32_t countValue = 0;
-uint8_t presetIndex = 0;
 int batteryLevel = -1;
+int batteryMillivolts = 0;
 bool charging = false;
+bool wifiPowerContext = false;
+bool monitorPowerContext = false;
 bool imuAvailable = false;
-bool ntpConfigured = false;
 bool uiDirty = true;
 bool alertPending = false;
 Face stableFace = Face::Unknown;
-Face flowFace = Face::Unknown;
+Face hourglassFace = Face::Unknown;
 Face candidateFace = Face::Unknown;
 uint32_t candidateSinceMs = 0;
-bool flowTriggeredForFace = false;
 uint32_t lastBatteryReadMs = 0;
 uint32_t lastImuReadMs = 0;
 uint32_t lastUiDrawMs = 0;
@@ -92,9 +91,8 @@ uint32_t lastMotionPeakAt = 0;
 
 const char* pageTitle() {
   switch (page) {
-    case Page::Now: return "NOW";
-    case Page::Focus: return "FOCUS";
-    case Page::Flow: return "FLOW";
+    case Page::Battery: return "BATTERY";
+    case Page::Hourglass: return "HOURGLASS";
     case Page::Together: return "TOGETHER";
   }
   return "LIFETIME";
@@ -108,17 +106,13 @@ const char* faceTitle(Face face) {
     case Face::Left: return "LEFT SIDE";
     case Face::Top: return "TOP EDGE";
     case Face::Bottom: return "BOTTOM EDGE";
-    case Face::Unknown: return "CHOOSE A SIDE";
+    case Face::Unknown: return "SET A DIRECTION";
   }
-  return "CHOOSE A SIDE";
+  return "SET A DIRECTION";
 }
 
 void markUiDirty() {
   uiDirty = true;
-}
-
-uint32_t presetDurationMs() {
-  return kPresetMinutes[presetIndex] * 60UL * 1000UL;
 }
 
 uint32_t faceDurationMs(Face face) {
@@ -140,35 +134,12 @@ void formatDuration(uint32_t remainingMs, char* buffer, size_t bufferSize) {
   }
 }
 
-bool getLocalTimeSafe(struct tm* localTime) {
-  const time_t now = time(nullptr);
-  return localTime != nullptr && now >= 1700000000 && localtime_r(&now, localTime) != nullptr;
-}
-
 void drawCentered(const String& text, int16_t y, uint8_t size, uint16_t color = kWhite,
                   uint16_t background = kBackground) {
   canvas.setTextDatum(textdatum_t::middle_center);
   canvas.setTextColor(color, background);
   canvas.setTextSize(size);
   canvas.drawString(text, canvas.width() / 2, y);
-}
-
-void drawBattery() {
-  constexpr int16_t x = 101;
-  constexpr int16_t y = 12;
-  canvas.drawRoundRect(x, y, 25, 12, 3, kMuted);
-  canvas.fillRect(x + 25, y + 4, 2, 4, kMuted);
-  if (batteryLevel >= 0) {
-    const int16_t fill = static_cast<int16_t>(19 * batteryLevel / 100);
-    canvas.fillRoundRect(x + 3, y + 3, fill, 6, 2,
-                         batteryLevel <= 15 ? kCoral : kMint);
-  }
-  if (charging) {
-    canvas.setTextDatum(textdatum_t::middle_right);
-    canvas.setTextColor(kYellow, kBackground);
-    canvas.setTextSize(1);
-    canvas.drawString("+", x - 5, y + 6);
-  }
 }
 
 void drawHeader(uint16_t accent) {
@@ -178,10 +149,9 @@ void drawHeader(uint16_t accent) {
   canvas.setTextColor(kWhite, kBackground);
   canvas.setTextSize(1);
   canvas.drawString(pageTitle(), 18, 18);
-  drawBattery();
-  for (uint8_t i = 0; i < 4; ++i) {
+  for (uint8_t i = 0; i < 3; ++i) {
     const bool active = static_cast<uint8_t>(page) == i;
-    canvas.fillCircle(51 + i * 11, 18, active ? 3 : 2, active ? accent : kSurfaceRaised);
+    canvas.fillCircle(98 + i * 11, 18, active ? 3 : 2, active ? accent : kSurfaceRaised);
   }
 }
 
@@ -196,123 +166,147 @@ void drawFooter(const char* left, const char* right, uint16_t accent) {
   canvas.drawString(right, 125, 222);
 }
 
-void drawNowPage() {
-  drawHeader(kMint);
-  struct tm localTime;
-  char timeText[16] = "--:--:--";
-  char dateText[24] = "WAITING FOR TIME";
-  if (getLocalTimeSafe(&localTime)) {
-    snprintf(timeText, sizeof(timeText), "%02d:%02d:%02d", localTime.tm_hour,
-             localTime.tm_min, localTime.tm_sec);
-    static constexpr const char* kMonths[] = {"JAN", "FEB", "MAR", "APR", "MAY", "JUN",
-                                               "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"};
-    snprintf(dateText, sizeof(dateText), "%s %02d  %04d", kMonths[localTime.tm_mon],
-             localTime.tm_mday, localTime.tm_year + 1900);
-  }
-  drawCentered(timeText, 67, 2);
-  drawCentered(dateText, 91, 1, kMuted);
+void drawWoodenFish(int16_t cx, int16_t cy) {
+  canvas.fillEllipse(cx, cy, 22, 14, kCoral);
+  canvas.fillTriangle(cx - 21, cy - 3, cx - 29, cy - 13, cx - 12, cy - 10, kCoral);
+  canvas.fillCircle(cx + 10, cy - 2, 2, kBackground);
+  canvas.drawArc(cx - 1, cy + 1, 15, 8, 15, 165, kYellow);
+  canvas.drawLine(cx + 17, cy - 16, cx + 27, cy - 27, kYellow);
+  canvas.fillCircle(cx + 28, cy - 28, 3, kYellow);
+}
 
-  canvas.drawFastHLine(14, 111, 107, kSurfaceRaised);
-  canvas.setTextDatum(textdatum_t::middle_left);
-  canvas.setTextColor(kMuted, kBackground);
-  canvas.drawString("MOMENTS", 16, 137);
+void drawBatteryPage() {
+  drawHeader(kMint);
+  constexpr int16_t x = 18;
+  constexpr int16_t y = 45;
+  constexpr int16_t width = 99;
+  constexpr int16_t height = 54;
+  canvas.drawRoundRect(x, y, width, height, 8, kMuted);
+  canvas.fillRoundRect(x + width, y + 17, 5, 20, 2, kMuted);
+  const int clampedLevel = batteryLevel < 0 ? 0 : min(100, batteryLevel);
+  const int16_t fillWidth = static_cast<int16_t>((width - 8) * clampedLevel / 100);
+  if (fillWidth > 0) {
+    canvas.fillRoundRect(x + 4, y + 4, fillWidth, height - 8, 5,
+                         clampedLevel <= 15 ? kCoral : kMint);
+  }
+  char percentage[12];
+  snprintf(percentage, sizeof(percentage), batteryLevel < 0 ? "--%%" : "%d%%", batteryLevel);
+  drawCentered(percentage, 72, 3, kWhite, fillWidth > 50 ? kMint : kBackground);
+
+  char batteryDetail[32];
+  if (charging) {
+    snprintf(batteryDetail, sizeof(batteryDetail), "CHARGING  %.2f V",
+             static_cast<float>(batteryMillivolts) / 1000.0f);
+  } else {
+    const uint32_t fullMinutes = monitorPowerContext ? LIFETIME_MONITOR_RUNTIME_MINUTES
+                                 : wifiPowerContext ? LIFETIME_WIFI_RUNTIME_MINUTES
+                                                    : LIFETIME_LOCAL_RUNTIME_MINUTES;
+    const uint32_t estimatedMinutes = batteryLevel < 0 ? 0 : fullMinutes * batteryLevel / 100;
+    snprintf(batteryDetail, sizeof(batteryDetail), "EST ~%luH %02luM  %.2fV",
+             static_cast<unsigned long>(estimatedMinutes / 60),
+             static_cast<unsigned long>(estimatedMinutes % 60),
+             static_cast<float>(batteryMillivolts) / 1000.0f);
+  }
+  drawCentered(batteryDetail, 113, 1, charging ? kYellow : kMuted);
+
+  canvas.drawFastHLine(14, 131, 107, kSurfaceRaised);
+  drawWoodenFish(43, 166);
+  canvas.setTextDatum(textdatum_t::middle_right);
   canvas.setTextColor(kWhite, kBackground);
   canvas.setTextSize(countValue > 999999 ? 2 : 3);
-  canvas.setTextDatum(textdatum_t::middle_right);
-  canvas.drawString(String(countValue), 119, 137);
-  canvas.setTextSize(1);
-
-  char focusText[28];
-  if (focusTimer.running) {
-    char remaining[16];
-    formatDuration(focusTimer.remainingMs, remaining, sizeof(remaining));
-    snprintf(focusText, sizeof(focusText), "FOCUS  %s", remaining);
-  } else {
-    snprintf(focusText, sizeof(focusText), "%s", WiFi.status() == WL_CONNECTED ? "TIME SYNCED"
-                                                                                : "TIME OFFLINE");
-  }
-  drawCentered(focusText, 181, 1, focusTimer.running ? kYellow : kMuted);
+  canvas.drawString(String(countValue), 119, 166);
   drawFooter("A NEXT", "B +1", kMint);
 }
 
-void drawFocusPage() {
-  drawHeader(kYellow);
-  const uint32_t totalMs = presetDurationMs();
-  const float fraction = totalMs == 0 ? 0.0f : min(1.0f, static_cast<float>(focusTimer.remainingMs) /
-                                                             static_cast<float>(totalMs));
+float faceAngle(Face face) {
+  switch (face) {
+    case Face::Right: return 90.0f;
+    case Face::Left: return -90.0f;
+    case Face::ScreenDown:
+    case Face::Bottom: return 180.0f;
+    default: return 0.0f;
+  }
+}
+
+Point rotatePoint(int16_t x, int16_t y, float angleDegrees) {
   constexpr int16_t cx = 67;
   constexpr int16_t cy = 105;
-  canvas.drawArc(cx, cy, 49, 43, 0, 360, kSurfaceRaised);
-  const int endAngle = static_cast<int>(360.0f * fraction);
-  if (endAngle > 1) {
-    canvas.drawArc(cx, cy, 49, 43, 0, endAngle, focusTimer.completed ? kCoral : kYellow);
-  }
-  char duration[16];
-  formatDuration(focusTimer.remainingMs, duration, sizeof(duration));
-  drawCentered(duration, cy - 3, 3);
-  const char* state = focusTimer.running ? "IN FOCUS"
-                      : focusTimer.completed ? "COMPLETE"
-                      : "READY";
-  drawCentered(state, cy + 27, 1, focusTimer.completed ? kCoral : kMuted);
-  char preset[24];
-  snprintf(preset, sizeof(preset), "%lu MIN PRESET",
-           static_cast<unsigned long>(kPresetMinutes[presetIndex]));
-  drawCentered(preset, 174, 1, kMuted);
-  drawFooter("A NEXT", focusTimer.running ? "A HOLD PAUSE" : "B PRESET", kYellow);
+  const float radians = angleDegrees * DEG_TO_RAD;
+  const float dx = x - cx;
+  const float dy = y - cy;
+  return {static_cast<int16_t>(lroundf(cx + dx * cosf(radians) - dy * sinf(radians))),
+          static_cast<int16_t>(lroundf(cy + dx * sinf(radians) + dy * cosf(radians)))};
 }
 
-void drawHourglass(uint32_t remainingMs, uint32_t totalMs) {
+void drawRotatedLine(int16_t x1, int16_t y1, int16_t x2, int16_t y2, float angle,
+                     uint16_t color) {
+  const Point a = rotatePoint(x1, y1, angle);
+  const Point b = rotatePoint(x2, y2, angle);
+  canvas.drawLine(a.x, a.y, b.x, b.y, color);
+}
+
+void fillRotatedTriangle(int16_t x1, int16_t y1, int16_t x2, int16_t y2, int16_t x3,
+                         int16_t y3, float angle, uint16_t color) {
+  const Point a = rotatePoint(x1, y1, angle);
+  const Point b = rotatePoint(x2, y2, angle);
+  const Point c = rotatePoint(x3, y3, angle);
+  canvas.fillTriangle(a.x, a.y, b.x, b.y, c.x, c.y, color);
+}
+
+void drawHourglass() {
   constexpr int16_t cx = 67;
-  constexpr int16_t top = 45;
+  constexpr int16_t top = 51;
   constexpr int16_t neck = 105;
-  constexpr int16_t bottom = 164;
-  constexpr int16_t half = 34;
+  constexpr int16_t bottom = 159;
+  constexpr int16_t half = 31;
+  const float angle = faceAngle(hourglassFace == Face::Unknown ? stableFace : hourglassFace);
 
-  canvas.fillRoundRect(cx - half - 5, top - 5, half * 2 + 10, 8, 4, kFrame);
-  canvas.fillRoundRect(cx - half - 5, bottom - 3, half * 2 + 10, 8, 4, kFrame);
-  canvas.drawLine(cx - half, top + 3, cx - 4, neck - 3, kGlass);
-  canvas.drawLine(cx - half + 2, top + 3, cx - 2, neck - 2, kGlass);
-  canvas.drawLine(cx + half, top + 3, cx + 4, neck - 3, kGlass);
-  canvas.drawLine(cx + half - 2, top + 3, cx + 2, neck - 2, kGlass);
-  canvas.drawLine(cx - 4, neck + 3, cx - half, bottom - 3, kGlass);
-  canvas.drawLine(cx - 2, neck + 2, cx - half + 2, bottom - 3, kGlass);
-  canvas.drawLine(cx + 4, neck + 3, cx + half, bottom - 3, kGlass);
-  canvas.drawLine(cx + 2, neck + 2, cx + half - 2, bottom - 3, kGlass);
+  for (int8_t thickness = -2; thickness <= 2; ++thickness) {
+    drawRotatedLine(cx - half - 4, top + thickness, cx + half + 4, top + thickness, angle,
+                    kFrame);
+    drawRotatedLine(cx - half - 4, bottom + thickness, cx + half + 4, bottom + thickness,
+                    angle, kFrame);
+  }
+  drawRotatedLine(cx - half, top + 3, cx - 3, neck - 3, angle, kGlass);
+  drawRotatedLine(cx + half, top + 3, cx + 3, neck - 3, angle, kGlass);
+  drawRotatedLine(cx - 3, neck + 3, cx - half, bottom - 3, angle, kGlass);
+  drawRotatedLine(cx + 3, neck + 3, cx + half, bottom - 3, angle, kGlass);
 
-  const float fraction = totalMs == 0 ? 0.0f : min(1.0f, static_cast<float>(remainingMs) /
-                                                             static_cast<float>(totalMs));
-  const int16_t topSandY = neck - 6 - static_cast<int16_t>(48.0f * fraction);
-  const int16_t topSandHalf = static_cast<int16_t>(3 + 28.0f * fraction);
+  const float fraction = hourglassTimer.totalMs == 0
+                             ? 0.0f
+                             : min(1.0f, static_cast<float>(hourglassTimer.remainingMs) /
+                                             static_cast<float>(hourglassTimer.totalMs));
   if (fraction > 0.01f) {
-    canvas.fillTriangle(cx - topSandHalf, topSandY, cx + topSandHalf, topSandY, cx, neck - 5,
+    const int16_t sandY = neck - 5 - static_cast<int16_t>(42.0f * fraction);
+    const int16_t sandHalf = static_cast<int16_t>(3 + 25.0f * fraction);
+    fillRotatedTriangle(cx - sandHalf, sandY, cx + sandHalf, sandY, cx, neck - 5, angle,
                         kYellow);
   }
-  const float bottomFraction = 1.0f - fraction;
-  const int16_t bottomSandY = bottom - 7 - static_cast<int16_t>(45.0f * bottomFraction);
-  if (bottomFraction > 0.01f) {
-    canvas.fillTriangle(cx, bottomSandY, cx - 29, bottom - 7, cx + 29, bottom - 7, kYellow);
+  const float fallen = 1.0f - fraction;
+  if (fallen > 0.01f) {
+    const int16_t sandY = bottom - 6 - static_cast<int16_t>(40.0f * fallen);
+    fillRotatedTriangle(cx, sandY, cx - 27, bottom - 6, cx + 27, bottom - 6, angle, kYellow);
   }
-  if (flowTimer.running && remainingMs > 0) {
-    for (uint8_t i = 0; i < 5; ++i) {
-      const int16_t y = neck + 1 + ((animationFrame * 4 + i * 9) % 42);
-      const int16_t x = cx + static_cast<int16_t>((i % 3) - 1);
-      if (y < bottomSandY) {
-        canvas.fillCircle(x, y, i % 2 == 0 ? 1 : 0, kYellow);
-      }
-    }
+  if (hourglassTimer.running && hourglassTimer.remainingMs > 0) {
+    const Point grain = rotatePoint(cx, neck + 4 + (animationFrame % 23), angle);
+    canvas.fillCircle(grain.x, grain.y, 1, kYellow);
   }
 }
 
-void drawFlowPage() {
+void drawHourglassPage() {
   drawHeader(kCyan);
-  drawHourglass(flowTimer.remainingMs, faceDurationMs(flowFace));
+  drawHourglass();
   char duration[16];
-  formatDuration(flowTimer.remainingMs, duration, sizeof(duration));
-  drawCentered(duration, 182, 2);
-  const Face shownFace = flowFace == Face::Unknown ? stableFace : flowFace;
-  drawCentered(imuAvailable ? faceTitle(shownFace) : "IMU NOT FOUND", 199, 1,
-               imuAvailable ? kCyan : kCoral);
-  drawFooter("A NEXT", flowTimer.running ? "A HOLD PAUSE" : "TURN TO START", kCyan);
+  formatDuration(hourglassTimer.remainingMs, duration, sizeof(duration));
+  drawCentered(duration, 177, 2);
+  const Face shownFace = hourglassFace == Face::Unknown ? stableFace : hourglassFace;
+  const char* status = !imuAvailable ? "IMU NOT FOUND"
+                       : hourglassTimer.completed ? "COMPLETE"
+                       : hourglassTimer.running ? faceTitle(shownFace)
+                       : hourglassTimer.remainingMs > 0 ? "PAUSED"
+                                                       : "TURN AND HOLD";
+  drawCentered(status, 198, 1, !imuAvailable ? kCoral : kCyan);
+  drawFooter("A NEXT", hourglassTimer.running ? "A HOLD PAUSE" : "HOLD TO START", kCyan);
 }
 
 void drawDeviceGlyph(int16_t x, int16_t y, uint16_t accent, bool active) {
@@ -327,7 +321,7 @@ void drawTogetherPage() {
   const bool receivedPulse = now - lastNudgeReceivedAt < 1800;
   const bool sentPulse = now - lastNudgeSentAt < 1200;
   const bool pulse = receivedPulse || sentPulse || outgoingNudgePending;
-  const int16_t radius = 14 + static_cast<int16_t>((animationFrame * 4) % 28);
+  const int16_t radius = 14 + static_cast<int16_t>((animationFrame * 5) % 28);
   if (pulse) {
     canvas.drawCircle(67, 96, radius, receivedPulse ? kCoral : kMint);
     if (radius > 20) {
@@ -342,7 +336,7 @@ void drawTogetherPage() {
   const char* status = outgoingNudgePending ? "WAITING FOR LINK"
                        : receivedPulse ? "PING FROM YOUR PEER"
                        : sentPulse ? "PING SENT"
-                       : "DOUBLE SHAKE TO PING";
+                                   : "DOUBLE SHAKE TO PING";
   drawCentered(status, 147, 1, receivedPulse ? kCoral : (sentPulse ? kMint : kWhite));
   if (lastNudgeSender != 0 && receivedPulse) {
     char peer[20];
@@ -363,20 +357,16 @@ void updateBattery() {
     return;
   }
   lastBatteryReadMs = now;
-  const int nextBatteryLevel = M5.Power.getBatteryLevel();
+  const int nextLevel = M5.Power.getBatteryLevel();
+  const int nextMillivolts = M5.Power.getBatteryVoltage();
   const bool nextCharging =
       M5.Power.isCharging() == m5::Power_Class::is_charging_t::is_charging;
-  if (nextBatteryLevel != batteryLevel || nextCharging != charging) {
-    batteryLevel = nextBatteryLevel;
+  if (nextLevel != batteryLevel || nextMillivolts != batteryMillivolts ||
+      nextCharging != charging) {
+    batteryLevel = nextLevel;
+    batteryMillivolts = nextMillivolts;
     charging = nextCharging;
     markUiDirty();
-  }
-}
-
-void ensureNtp() {
-  if (!ntpConfigured && WiFi.status() == WL_CONNECTED) {
-    configTzTime(LIFETIME_TIMEZONE, LIFETIME_NTP_SERVER_1, LIFETIME_NTP_SERVER_2);
-    ntpConfigured = true;
   }
 }
 
@@ -384,51 +374,47 @@ void resetTimer(TimerState& timer, uint32_t durationMs) {
   timer.running = false;
   timer.completed = false;
   timer.remainingMs = durationMs;
+  timer.totalMs = durationMs;
   timer.lastTickMs = millis();
   markUiDirty();
 }
 
-void finishTimer(TimerState& timer, const char* name) {
-  timer.running = false;
-  timer.remainingMs = 0;
-  timer.completed = true;
-  alertPending = true;
-  Serial.printf("%s complete\n", name);
+void startHourglass(Face face, uint32_t now) {
+  const uint32_t durationMs = faceDurationMs(face);
+  if (durationMs == 0) {
+    return;
+  }
+  hourglassFace = face;
+  hourglassTimer.totalMs = durationMs;
+  hourglassTimer.remainingMs = durationMs;
+  hourglassTimer.running = true;
+  hourglassTimer.completed = false;
+  hourglassTimer.lastTickMs = now;
+  Serial.printf("Hourglass %s: %lu seconds\n", faceTitle(face),
+                static_cast<unsigned long>(durationMs / 1000));
   markUiDirty();
 }
 
-void updateTimer(TimerState& timer, const char* name) {
-  if (!timer.running) {
+void updateTimer() {
+  if (!hourglassTimer.running) {
     return;
   }
-  const uint32_t beforeSeconds = (timer.remainingMs + 999) / 1000;
+  const uint32_t beforeSeconds = (hourglassTimer.remainingMs + 999) / 1000;
   const uint32_t now = millis();
-  const uint32_t elapsed = now - timer.lastTickMs;
-  timer.lastTickMs = now;
-  if (elapsed >= timer.remainingMs) {
-    finishTimer(timer, name);
-    return;
-  }
-  timer.remainingMs -= elapsed;
-  if ((timer.remainingMs + 999) / 1000 != beforeSeconds) {
-    markUiDirty();
-  }
-}
-
-void startOrPauseTimer(TimerState& timer, uint32_t durationMs, const char* name) {
-  if (timer.running) {
-    timer.running = false;
+  const uint32_t elapsed = now - hourglassTimer.lastTickMs;
+  hourglassTimer.lastTickMs = now;
+  if (elapsed >= hourglassTimer.remainingMs) {
+    hourglassTimer.running = false;
+    hourglassTimer.remainingMs = 0;
+    hourglassTimer.completed = true;
+    alertPending = true;
     markUiDirty();
     return;
   }
-  if (timer.remainingMs == 0 || timer.completed) {
-    timer.remainingMs = durationMs;
-    timer.completed = false;
+  hourglassTimer.remainingMs -= elapsed;
+  if ((hourglassTimer.remainingMs + 999) / 1000 != beforeSeconds) {
+    markUiDirty();
   }
-  timer.running = true;
-  timer.lastTickMs = millis();
-  Serial.printf("%s started\n", name);
-  markUiDirty();
 }
 
 Face classifyFace(float x, float y, float z) {
@@ -479,7 +465,8 @@ void detectNudgeGesture(float x, float y, float z) {
 
 void updateOrientation(bool foreground) {
   const uint32_t now = millis();
-  if (!foreground || !imuAvailable || now - lastImuReadMs < LIFETIME_IMU_SAMPLE_MS) {
+  if (!foreground || page == Page::Battery || !imuAvailable ||
+      now - lastImuReadMs < LIFETIME_IMU_SAMPLE_MS) {
     return;
   }
   lastImuReadMs = now;
@@ -492,18 +479,15 @@ void updateOrientation(bool foreground) {
   if (!M5.Imu.getAccel(&x, &y, &z)) {
     return;
   }
-  if (foreground) {
-    detectNudgeGesture(x, y, z);
+  detectNudgeGesture(x, y, z);
+  if (page != Page::Hourglass) {
+    return;
   }
 
   const Face detected = classifyFace(x, y, z);
   if (detected != candidateFace) {
     candidateFace = detected;
     candidateSinceMs = now;
-    if (detected == Face::Unknown) {
-      flowTriggeredForFace = false;
-    }
-    markUiDirty();
     return;
   }
   if (detected == Face::Unknown || now - candidateSinceMs < LIFETIME_ORIENTATION_STABLE_MS) {
@@ -511,29 +495,14 @@ void updateOrientation(bool foreground) {
   }
   if (stableFace != detected) {
     stableFace = detected;
-    flowTriggeredForFace = false;
-    markUiDirty();
-  }
-  if (foreground && page == Page::Flow && !flowTimer.running && !flowTimer.completed &&
-      !flowTriggeredForFace) {
-    const uint32_t durationMs = faceDurationMs(stableFace);
-    if (durationMs > 0) {
-      flowFace = stableFace;
-      flowTimer.remainingMs = durationMs;
-      flowTimer.running = true;
-      flowTimer.lastTickMs = now;
-      flowTriggeredForFace = true;
-      Serial.printf("Flow %s: %lu seconds\n", faceTitle(stableFace),
-                    static_cast<unsigned long>(durationMs / 1000));
-      markUiDirty();
-    }
+    startHourglass(detected, now);
   }
 }
 
 bool animatedNow(uint32_t now) {
-  return (page == Page::Flow && flowTimer.running) ||
-         (page == Page::Together && (outgoingNudgePending || now - lastNudgeSentAt < 1200 ||
-                                     now - lastNudgeReceivedAt < 1800));
+  return page == Page::Together &&
+         (outgoingNudgePending || now - lastNudgeSentAt < 1200 ||
+          now - lastNudgeReceivedAt < 1800);
 }
 
 }  // namespace
@@ -541,10 +510,8 @@ bool animatedNow(uint32_t now) {
 void begin() {
   preferences.begin("lifetime", false);
   countValue = preferences.getULong("count", 0);
-  presetIndex = min<uint8_t>(preferences.getUChar("preset", 0), kPresetCount - 1);
   nudgeSentCount = preferences.getULong("nudges_tx", 0);
   nudgeReceivedCount = preferences.getULong("nudges_rx", 0);
-  resetTimer(focusTimer, presetDurationMs());
   imuAvailable = M5.Imu.isEnabled();
   canvas.setColorDepth(16);
   canvasReady = canvas.createSprite(M5.Display.width(), M5.Display.height()) != nullptr;
@@ -561,11 +528,12 @@ void onEnter() {
 }
 
 void update(bool foreground) {
-  ensureNtp();
+  if (!foreground) {
+    return;
+  }
   updateBattery();
-  updateOrientation(foreground);
-  updateTimer(focusTimer, "Focus");
-  updateTimer(flowTimer, "Flow");
+  updateOrientation(true);
+  updateTimer();
 }
 
 void draw(bool force) {
@@ -574,18 +542,16 @@ void draw(bool force) {
   }
   const uint32_t now = millis();
   const bool animated = animatedNow(now);
-  const uint32_t refreshMs = animated ? kAnimatedRefreshMs : kStaticRefreshMs;
-  if (!force && now - lastUiDrawMs < refreshMs) {
+  if (!force && !uiDirty && !animated) {
     return;
   }
-  if (!force && !uiDirty && !animated && page != Page::Now) {
+  if (!force && animated && now - lastUiDrawMs < kPulseRefreshMs) {
     return;
   }
   ++animationFrame;
   switch (page) {
-    case Page::Now: drawNowPage(); break;
-    case Page::Focus: drawFocusPage(); break;
-    case Page::Flow: drawFlowPage(); break;
+    case Page::Battery: drawBatteryPage(); break;
+    case Page::Hourglass: drawHourglassPage(); break;
     case Page::Together: drawTogetherPage(); break;
   }
   M5.Display.startWrite();
@@ -595,10 +561,32 @@ void draw(bool force) {
   uiDirty = false;
 }
 
+void resetRuntime() {
+  resetTimer(hourglassTimer, 0);
+  stableFace = Face::Unknown;
+  hourglassFace = Face::Unknown;
+  candidateFace = Face::Unknown;
+  candidateSinceMs = 0;
+  outgoingNudgePending = false;
+  motionPeakCount = 0;
+  alertPending = false;
+}
+
+void setPowerContext(bool wifi, bool monitorOnly) {
+  if (wifiPowerContext == wifi && monitorPowerContext == monitorOnly) {
+    return;
+  }
+  wifiPowerContext = wifi;
+  monitorPowerContext = monitorOnly;
+  markUiDirty();
+}
+
 void handleAShortPress() {
-  page = static_cast<Page>((static_cast<uint8_t>(page) + 1) % 4);
-  if (page == Page::Flow) {
-    flowTriggeredForFace = false;
+  page = static_cast<Page>((static_cast<uint8_t>(page) + 1) % 3);
+  if (page == Page::Hourglass) {
+    stableFace = Face::Unknown;
+    candidateFace = Face::Unknown;
+    candidateSinceMs = 0;
   }
   motionPeakCount = 0;
   markUiDirty();
@@ -606,21 +594,19 @@ void handleAShortPress() {
 }
 
 void handleALongPress() {
-  if (page == Page::Focus) {
-    startOrPauseTimer(focusTimer, presetDurationMs(), "Focus");
-  } else if (page == Page::Flow && flowTimer.remainingMs > 0 && !flowTimer.completed) {
-    startOrPauseTimer(flowTimer, flowTimer.remainingMs, "Flow");
+  if (page != Page::Hourglass || hourglassTimer.remainingMs == 0 ||
+      hourglassTimer.completed) {
+    return;
   }
+  hourglassTimer.running = !hourglassTimer.running;
+  hourglassTimer.lastTickMs = millis();
+  markUiDirty();
 }
 
 void handleBShortPress() {
-  if (page == Page::Now) {
+  if (page == Page::Battery) {
     ++countValue;
     preferences.putULong("count", countValue);
-  } else if (page == Page::Focus && !focusTimer.running) {
-    presetIndex = (presetIndex + 1) % kPresetCount;
-    preferences.putUChar("preset", presetIndex);
-    resetTimer(focusTimer, presetDurationMs());
   } else if (page == Page::Together) {
     requestNudge();
   }
@@ -628,15 +614,14 @@ void handleBShortPress() {
 }
 
 void handleBLongPress() {
-  if (page == Page::Now) {
+  if (page == Page::Battery) {
     countValue = 0;
     preferences.putULong("count", countValue);
-  } else if (page == Page::Focus) {
-    resetTimer(focusTimer, presetDurationMs());
-  } else if (page == Page::Flow) {
-    resetTimer(flowTimer, faceDurationMs(stableFace));
-    flowFace = stableFace;
-    flowTriggeredForFace = false;
+  } else if (page == Page::Hourglass) {
+    resetTimer(hourglassTimer, 0);
+    stableFace = Face::Unknown;
+    hourglassFace = Face::Unknown;
+    candidateFace = Face::Unknown;
   } else if (page == Page::Together) {
     nudgeSentCount = 0;
     nudgeReceivedCount = 0;

@@ -14,12 +14,12 @@ M5Unified hardware
        `- Wi-Fi + MQTT worker task
 ```
 
-应用切换只改变前台界面。MQTT、接收队列、待发语音和 LifeTime 定时器继续在后台运行。
+应用切换只改变前台界面。MQTT、接收队列和待发语音继续在后台运行；LifeTime 只在前台更新。省电监听会进一步暂停发件与 LifeTime，只保留收件。
 
 ## 并发模型
 
 - Arduino `loop()`：按键、UI、录音状态、播放、ESP-NOW 队列和 LifeTime。
-- MQTT FreeRTOS Task：连接、Keepalive、订阅、接收和发布。
+- MQTT FreeRTOS Task：连接、Keepalive、订阅、接收和发布；空闲检查间隔可配置，发布使用任务通知立即唤醒。
 - FreeRTOS Queue：在线程之间传递固定大小的网络帧和发布结果。
 - PSRAM：发送语音 5 槽、接收语音 5 槽、录制/重组缓冲和 LifeTime 全屏 Canvas。
 
